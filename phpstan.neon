@@ -1,0 +1,15 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    level: 6
+    paths:
+        - src
+    excludePaths:
+        - vendor
+
+    # Reportable callback accepts `?bool` in some Laravel versions, `void` in
+    # others — ignore to let the package run on the full matrix.
+    ignoreErrors:
+        - '#Anonymous function should return void but return statement is missing#'
+        - '#Method .+ has parameter .+ with no value type specified in iterable type array#'
