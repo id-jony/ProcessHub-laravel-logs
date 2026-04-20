@@ -17,6 +17,9 @@ class ProcessHubServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
+        // Capture boot time once so heartbeats can report real uptime.
+        HeartbeatCommand::markBootedNow();
+
         // Merge defaults — user's `config/processhub.php` wins after publish.
         $this->mergeConfigFrom(__DIR__ . '/../config/processhub.php', 'processhub');
 

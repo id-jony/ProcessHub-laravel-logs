@@ -12,15 +12,17 @@ use Illuminate\Console\Command;
  * /api/ingest/heartbeat with version + uptime so ProcessHub knows the app
  * is alive. Status flips to OFFLINE after 3 missed heartbeats.
  *
- * Failures are intentionally silent — a blip in the monitoring path
- * shouldn't spam the app's own error log.
+ * Failures are logged via Laravel's default logger (warning) and, when
+ * `--verbose-output` is passed, printed to the console for diagnostics.
+ * The command always returns SUCCESS so a transient network blip doesn't
+ * bubble up as a scheduler failure.
  */
 class HeartbeatCommand extends Command
 {
-    protected $signature = 'processhub:heartbeat';
+    protected $signature = 'processhub:heartbeat {--verbose-output : Print response status and body}';
     protected $description = 'Ping ProcessHub heartbeat endpoint (called by scheduler)';
 
-    /** @var float Process start time, captured per-command for uptime. */
+    /** @var float Process start time, captured once at boot for uptime. */
     protected static float $bootedAt;
 
     public static function markBootedNow(): void
@@ -39,25 +41,52 @@ class HeartbeatCommand extends Command
 
         $client = new Client([
             'base_uri' => rtrim($url, '/'),
-            'timeout' => 3,
+            'timeout' => 5,
             'http_errors' => false,
         ]);
 
+        // Strip nulls — server's zod schema uses .optional() which accepts
+        // missing keys but NOT explicit null. Sending {"version":null} → 400.
+        $payload = array_filter([
+            'version' => config('app.version'),
+            'uptime' => isset(self::$bootedAt)
+                ? (int) (microtime(true) - self::$bootedAt)
+                : null,
+        ], fn ($v) => $v !== null);
+
+        $verbose = (bool) $this->option('verbose-output');
+
         try {
-            $client->post('/api/ingest/heartbeat', [
+            $response = $client->post('/api/ingest/heartbeat', [
                 'headers' => [
                     'Authorization' => "Bearer {$token}",
                     'Content-Type' => 'application/json',
                 ],
-                'json' => [
-                    'version' => config('app.version', null),
-                    'uptime' => isset(self::$bootedAt)
-                        ? (int) (microtime(true) - self::$bootedAt)
-                        : null,
-                ],
+                // Cast to object so an empty payload serialises as "{}", not "[]".
+                'json' => (object) $payload,
             ]);
-        } catch (\Throwable) {
-            // swallow — next tick will try again
+
+            $status = $response->getStatusCode();
+            $body = (string) $response->getBody();
+
+            if ($verbose) {
+                $this->line("Status: {$status}");
+                $this->line($body);
+            }
+
+            if ($status >= 400) {
+                logger()->warning('processhub:heartbeat failed', [
+                    'status' => $status,
+                    'body' => $body,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            if ($verbose) {
+                $this->error($e->getMessage());
+            }
+            logger()->warning('processhub:heartbeat exception', [
+                'error' => $e->getMessage(),
+            ]);
         }
 
         return self::SUCCESS;
