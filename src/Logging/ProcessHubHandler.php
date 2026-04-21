@@ -23,6 +23,16 @@ use ProcessHub\Logs\Redaction\Redactor;
  */
 class ProcessHubHandler extends AbstractProcessingHandler
 {
+    /**
+     * Whitelist of `contextType` discriminators accepted by the server's
+     * zod enum. Anything else is dropped to null so the user's own
+     * `context.type` (e.g. "video", "audio") doesn't clash with our
+     * reserved wire-format field and trigger a 400.
+     */
+    private const ALLOWED_CONTEXT_TYPES = [
+        'exception', 'query', 'job', 'mail', 'http', 'scheduled',
+    ];
+
     public function __construct(
         private readonly QueueFactory $queue,
         Level|int|string $level = Level::Warning,
@@ -65,7 +75,15 @@ class ProcessHubHandler extends AbstractProcessingHandler
     protected function buildEntry(LogRecord $record): array
     {
         $context = Redactor::redact($record->context ?? []);
-        $contextType = is_string($context['type'] ?? null) ? $context['type'] : null;
+
+        // contextType is a closed enum on the server (exception/query/job/mail/
+        // http/scheduled). User code often puts domain-specific values in
+        // `context.type` ("video", "audio", …) — those must NOT leak into the
+        // wire-format contextType, else the batch is rejected with 400.
+        $rawType = $context['type'] ?? null;
+        $contextType = is_string($rawType) && in_array($rawType, self::ALLOWED_CONTEXT_TYPES, true)
+            ? $rawType
+            : null;
 
         // If a Throwable was passed in context (Laravel Exception handler does
         // this) — extract a structured exception payload so ProcessHub can

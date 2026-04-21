@@ -6,10 +6,13 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Support\ServiceProvider;
+use ProcessHub\Logs\Commands\ConfigRefreshCommand;
+use ProcessHub\Logs\Commands\ConfigShowCommand;
 use ProcessHub\Logs\Commands\FlushFallbackCommand;
 use ProcessHub\Logs\Commands\HeartbeatCommand;
 use ProcessHub\Logs\Commands\InstallCommand;
 use ProcessHub\Logs\Commands\TestCommand;
+use ProcessHub\Logs\Config\RemoteConfigClient;
 use ProcessHub\Logs\Listeners\HandleExceptionReported;
 use ProcessHub\Logs\Middleware\CorrelateRequestId;
 
@@ -25,6 +28,10 @@ class ProcessHubServiceProvider extends ServiceProvider
 
         // Manager backing the `ProcessHub` facade (ProcessHub::markDeploy).
         $this->app->singleton(ProcessHubManager::class);
+
+        // Remote-config client — singleton because it caches state across
+        // the request lifecycle and heartbeat ticks.
+        $this->app->singleton(RemoteConfigClient::class);
     }
 
     public function boot(): void
@@ -41,8 +48,16 @@ class ProcessHubServiceProvider extends ServiceProvider
                 TestCommand::class,
                 HeartbeatCommand::class,
                 FlushFallbackCommand::class,
+                ConfigRefreshCommand::class,
+                ConfigShowCommand::class,
             ]);
         }
+
+        // 2a. Load any cached remote config into the runtime config bag
+        //     BEFORE listeners/scheduler read their flags. This is why all
+        //     downstream code can keep using `config('processhub.*')` —
+        //     remote values override env/defaults transparently.
+        $this->app->make(RemoteConfigClient::class)->bootstrap();
 
         // 3. Register request-id middleware globally so every controller
         //    call gets an X-Request-Id propagated into Monolog context.

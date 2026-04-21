@@ -4,6 +4,7 @@ namespace ProcessHub\Logs\Commands;
 
 use GuzzleHttp\Client;
 use Illuminate\Console\Command;
+use ProcessHub\Logs\Config\RemoteConfigClient;
 
 /**
  * `php artisan processhub:heartbeat`
@@ -30,7 +31,7 @@ class HeartbeatCommand extends Command
         self::$bootedAt = microtime(true);
     }
 
-    public function handle(): int
+    public function handle(RemoteConfigClient $configClient): int
     {
         $url = config('processhub.url');
         $token = config('processhub.token');
@@ -79,6 +80,24 @@ class HeartbeatCommand extends Command
                     'status' => $status,
                     'body' => $body,
                 ]);
+            } elseif ($status === 200) {
+                // Parse config etag from response; pull a fresh config when
+                // it differs from our cache. Don't let a malformed body
+                // break heartbeat — just skip the refresh step on parse fail.
+                try {
+                    $decoded = json_decode($body, true);
+                    $remoteEtag = $decoded['config']['etag'] ?? null;
+                    if (is_string($remoteEtag)) {
+                        $changed = $configClient->refreshIfChanged($remoteEtag);
+                        if ($changed && $verbose) {
+                            $this->info('Remote config refreshed (v'.$configClient->cachedVersion().').');
+                        }
+                    }
+                } catch (\Throwable $parseErr) {
+                    logger()->warning('processhub:heartbeat config parse failed', [
+                        'error' => $parseErr->getMessage(),
+                    ]);
+                }
             }
         } catch (\Throwable $e) {
             if ($verbose) {
