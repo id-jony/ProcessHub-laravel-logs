@@ -15,16 +15,20 @@ use ProcessHub\Logs\ProcessHubManager;
  * Designed to run as the FINAL step in a CI/Forge/Envoyer deploy script:
  *
  *     # In Forge/Envoyer recipe, after `php artisan migrate --force`:
- *     php artisan processhub:deploy --version="$RELEASE" --commit="$COMMIT_SHA"
+ *     php artisan processhub:deploy "$RELEASE" --commit="$COMMIT_SHA"
  *
  *     # If the deploy itself failed and you want a marker recorded
  *     # (so the failure shows on the timeline):
- *     php artisan processhub:deploy --version="$RELEASE" --failed
+ *     php artisan processhub:deploy "$RELEASE" --failed
+ *
+ * NOTE: version is a POSITIONAL argument, not `--version`. Symfony Console
+ * reserves `--version` at the application level (it prints the framework
+ * version and exits before any command runs). Hence the bare argument.
  *
  * Defaults:
- *  - `--version` falls back to `config('app.version')`. If neither flag
- *    nor config provides a version, the command fails — a deploy marker
- *    without a version is useless on the timeline.
+ *  - Positional `version` falls back to `config('app.version')` if omitted.
+ *    If neither argument nor config provides one, the command fails — a
+ *    deploy marker without a version is useless on the timeline.
  *  - `--commit` falls back to the current git HEAD if the deploy is run
  *    from inside the repo working tree. Set `--commit=""` to suppress.
  *
@@ -34,7 +38,7 @@ use ProcessHub\Logs\ProcessHubManager;
 class DeployCommand extends Command
 {
     protected $signature = 'processhub:deploy
-        {--version= : Release tag (default: config("app.version"))}
+        {version? : Release tag (default: config("app.version"))}
         {--commit= : Commit SHA (default: git HEAD if available)}
         {--failed : Record this deploy as failed (success=false)}
         {--metadata=* : key=value pairs added to metadata JSON}
@@ -51,9 +55,9 @@ class DeployCommand extends Command
             return self::FAILURE;
         }
 
-        $version = $this->option('version') ?: config('app.version');
+        $version = $this->argument('version') ?: config('app.version');
         if (! is_string($version) || $version === '') {
-            $this->error('No version: pass --version="v1.4.2" or set config("app.version").');
+            $this->error('No version: pass it as an argument (php artisan processhub:deploy v1.4.2) or set config("app.version").');
             return self::FAILURE;
         }
 
