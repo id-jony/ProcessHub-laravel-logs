@@ -33,6 +33,27 @@ class ProcessHubHandler extends AbstractProcessingHandler
         'exception', 'query', 'job', 'mail', 'http', 'scheduled',
     ];
 
+    /**
+     * PSR-3 / RFC 5424 numeric severities. Used to compare a record's level
+     * against `processhub.min_level` (string from remote config).
+     *
+     * NOTE: this is a SECOND filter on top of the Monolog channel `level`
+     * configured in `config/logging.php`. We can only TIGHTEN further — if
+     * the channel is at WARNING, setting min_level=info won't make INFO
+     * events appear (Monolog drops them before write() is even called).
+     * Document this clearly in the UI and README.
+     */
+    private const PSR3_LEVELS = [
+        'debug'     => 100,
+        'info'      => 200,
+        'notice'    => 250,
+        'warning'   => 300,
+        'error'     => 400,
+        'critical'  => 500,
+        'alert'     => 550,
+        'emergency' => 600,
+    ];
+
     public function __construct(
         private readonly QueueFactory $queue,
         Level|int|string $level = Level::Warning,
@@ -49,6 +70,30 @@ class ProcessHubHandler extends AbstractProcessingHandler
             // Package not configured — silently drop. Install command will
             // have already warned the user.
             return;
+        }
+
+        // Master kill-switch from remote config — when ops flips
+        // `enabled = false` in the ProcessHub UI, drop the record before
+        // queueing. Heartbeat refreshes config so the toggle propagates
+        // within ~60s. Server-side ingest also enforces this as a backup.
+        if (config('processhub.enabled', true) === false) {
+            return;
+        }
+
+        // Remote min_level filter — the Monolog channel level is the lower
+        // bound (we cannot loosen it past what the channel passes), but we
+        // CAN tighten further at runtime via remote config without redeploy.
+        // Example: channel level=info, remote min_level=error → only ERROR+
+        // events get queued. This is the bug fix for "поставил error, всё
+        // равно приходит INFO/WARN" — handler used to ignore the setting.
+        $minLevelName = config('processhub.min_level');
+        if (is_string($minLevelName)) {
+            $minLevelName = strtolower($minLevelName);
+            if (isset(self::PSR3_LEVELS[$minLevelName])
+                && $record->level->value < self::PSR3_LEVELS[$minLevelName]
+            ) {
+                return;
+            }
         }
 
         $entry = $this->buildEntry($record);
