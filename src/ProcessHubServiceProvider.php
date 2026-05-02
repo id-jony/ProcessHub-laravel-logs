@@ -8,6 +8,7 @@ use Illuminate\Contracts\Http\Kernel;
 use Illuminate\Support\ServiceProvider;
 use ProcessHub\Logs\Commands\ConfigRefreshCommand;
 use ProcessHub\Logs\Commands\ConfigShowCommand;
+use ProcessHub\Logs\Commands\DeployCommand;
 use ProcessHub\Logs\Commands\FlushFallbackCommand;
 use ProcessHub\Logs\Commands\HeartbeatCommand;
 use ProcessHub\Logs\Commands\InstallCommand;
@@ -50,6 +51,7 @@ class ProcessHubServiceProvider extends ServiceProvider
                 FlushFallbackCommand::class,
                 ConfigRefreshCommand::class,
                 ConfigShowCommand::class,
+                DeployCommand::class,
             ]);
         }
 
