@@ -94,4 +94,31 @@ return [
         'job_failures' => true,
         'scheduled_tasks' => true,
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Payouts (tax-agent payout ingest)
+    |--------------------------------------------------------------------------
+    |
+    | Enabled by default; the package is still a no-op until the host app
+    | calls `Payouts::register(Model::class, fn ($m) => [...])` in its
+    | `AppServiceProvider::boot`. Cadence / mode are overridden at runtime by
+    | RemoteConfigClient when ProcessHub's `payoutSource.cadence` is set —
+    | the defaults below only matter before the first heartbeat-config
+    | refresh (initial boot, fresh install).
+    */
+    'payouts' => [
+        'enabled' => (bool) env('PROCESSHUB_PAYOUTS_ENABLED', true),
+        'queue' => env('PROCESSHUB_PAYOUTS_QUEUE', 'default'),
+        'connection' => env('PROCESSHUB_PAYOUTS_CONNECTION'),
+        'default_cron' => env('PROCESSHUB_PAYOUTS_DEFAULT_CRON', '0 * * * *'),
+        'observe_model_changes' => true,
+        // Server-provided hint used only when the local watermark file is
+        // missing (e.g. after a manual `storage/app` reset). Populated by
+        // RemoteConfigClient from `payoutSource.watermark`.
+        'server_watermark' => null,
+        // sha256 of the active PayoutColumnConfig on the ProcessHub side.
+        // Informational — the package doesn't act on it, but we log changes.
+        'columns_hash' => null,
+    ],
 ];
