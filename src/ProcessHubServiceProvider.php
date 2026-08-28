@@ -16,11 +16,6 @@ use ProcessHub\Logs\Commands\TestCommand;
 use ProcessHub\Logs\Config\RemoteConfigClient;
 use ProcessHub\Logs\Listeners\HandleExceptionReported;
 use ProcessHub\Logs\Middleware\CorrelateRequestId;
-use ProcessHub\Logs\Payouts\Commands\PushPayoutsCommand;
-use ProcessHub\Logs\Payouts\IngestClient as PayoutsIngestClient;
-use ProcessHub\Logs\Payouts\Observers\PayoutsModelObserver;
-use ProcessHub\Logs\Payouts\PayoutsManager;
-use ProcessHub\Logs\Payouts\WatermarkStore as PayoutsWatermarkStore;
 
 class ProcessHubServiceProvider extends ServiceProvider
 {
@@ -38,14 +33,6 @@ class ProcessHubServiceProvider extends ServiceProvider
         // Remote-config client — singleton because it caches state across
         // the request lifecycle and heartbeat ticks.
         $this->app->singleton(RemoteConfigClient::class);
-
-        // Payouts module — singletons so registration done in
-        // `AppServiceProvider::boot` survives across HTTP requests and
-        // queue worker jobs.
-        $this->app->singleton(PayoutsManager::class);
-        $this->app->singleton(PayoutsIngestClient::class);
-        $this->app->singleton(PayoutsWatermarkStore::class);
-        $this->app->alias(PayoutsManager::class, 'processhub.payouts');
     }
 
     public function boot(): void
@@ -65,7 +52,6 @@ class ProcessHubServiceProvider extends ServiceProvider
                 ConfigRefreshCommand::class,
                 ConfigShowCommand::class,
                 DeployCommand::class,
-                PushPayoutsCommand::class,
             ]);
         }
 
@@ -94,45 +80,6 @@ class ProcessHubServiceProvider extends ServiceProvider
                 ->everyMinute()
                 ->withoutOverlapping()
                 ->runInBackground();
-        });
-
-        // 4a. Payouts scheduler — uses the remote-config-driven cron expr so
-        //     ProcessHub-side cadence changes propagate without a deploy.
-        $this->app->booted(function () {
-            if (! config('processhub.payouts.enabled', true)) {
-                return;
-            }
-            $cron = config('processhub.payouts.default_cron');
-            if (! is_string($cron) || $cron === '') {
-                return;
-            }
-            /** @var Schedule $schedule */
-            $schedule = $this->app->make(Schedule::class);
-            $schedule->command('processhub:payouts:push')
-                ->cron($cron)
-                ->withoutOverlapping()
-                ->runInBackground();
-        });
-
-        // 4b. Payouts observer auto-registration — wired here (not in
-        //     register()) because we need the host app's AppServiceProvider::boot
-        //     to have run `Payouts::register(Model::class, ...)` first.
-        $this->app->booted(function () {
-            if (! config('processhub.payouts.enabled', true)) {
-                return;
-            }
-            if (! config('processhub.payouts.observe_model_changes', true)) {
-                return;
-            }
-            $manager = $this->app->make(PayoutsManager::class);
-            $source = $manager->source();
-            if ($source === null) {
-                // No model registered yet — observer would have nothing to bind to.
-                return;
-            }
-            // observe() is idempotent at the Eloquent layer, so re-running on
-            // every boot is fine.
-            $source->model::observe(PayoutsModelObserver::class);
         });
 
         // 5. Register Laravel event listeners (QueryExecuted, JobFailed, …).

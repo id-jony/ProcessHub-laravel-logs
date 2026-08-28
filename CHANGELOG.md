@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-29
+
+### Removed
+
+- **BREAKING: Payouts module removed** — ProcessHub dropped the Payouts
+  feature server-side (`POST /api/ingest/payouts` and the `payoutSource`
+  section of `GET /api/ingest/config` no longer exist), so the whole client
+  subsystem is gone: the `Payouts` facade and `src/Payouts/*`,
+  `processhub:payouts:push` artisan command, `PayoutsModelObserver`,
+  `PushSinglePayoutJob`, the payout scheduler hook, the `processhub.payouts`
+  config section and `PROCESSHUB_PAYOUTS_*` env vars. Host apps that called
+  `Payouts::register(...)` must delete that call. The config `etag` returned
+  by `/api/ingest/config` and the heartbeat is now the plain app-config etag
+  (byte-identical for installs that never had a payout source). Logs,
+  heartbeat, deploy markers and remote config are unaffected.
+
 ## [0.2.0] — 2026-05-21
 
 ### Added

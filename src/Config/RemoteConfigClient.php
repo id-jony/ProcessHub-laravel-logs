@@ -222,44 +222,6 @@ class RemoteConfigClient
             $this->config->set('processhub.redact.remote_patterns', $remote['redactionPatterns']);
         }
 
-        // Payouts module — see docs/16-payouts-module.md "GET /api/ingest/config".
-        // Server is authoritative on enabled / cadence / mode; the package keeps
-        // local file-based watermark, the server-side `watermark` is a fallback
-        // only used when the file is missing.
-        if (isset($remote['payoutSource']) && is_array($remote['payoutSource'])) {
-            $ps = $remote['payoutSource'];
-            if (array_key_exists('enabled', $ps)) {
-                $this->config->set('processhub.payouts.enabled', (bool) $ps['enabled']);
-            }
-            if (isset($ps['cadence']) && is_array($ps['cadence'])) {
-                $cadence = $ps['cadence'];
-                if (isset($cadence['cronExpr']) && is_string($cadence['cronExpr']) && $cadence['cronExpr'] !== '') {
-                    $this->config->set('processhub.payouts.default_cron', $cadence['cronExpr']);
-                }
-                if (isset($cadence['mode']) && is_string($cadence['mode'])) {
-                    $this->config->set(
-                        'processhub.payouts.observe_model_changes',
-                        in_array($cadence['mode'], ['on-status-change', 'both'], true),
-                    );
-                }
-            }
-            if (isset($ps['watermark']) && is_scalar($ps['watermark'])) {
-                $this->config->set('processhub.payouts.server_watermark', (string) $ps['watermark']);
-            }
-            if (isset($ps['columnsHash']) && is_string($ps['columnsHash'])) {
-                $previous = $this->config->get('processhub.payouts.columns_hash');
-                $this->config->set('processhub.payouts.columns_hash', $ps['columnsHash']);
-                if ($previous !== null && $previous !== $ps['columnsHash']) {
-                    // Informational — re-ingesting same rows is harmless,
-                    // ProcessHub recomputes formulas server-side. We just
-                    // want the change to be visible in client logs.
-                    logger()->info('processhub:payouts: columnsHash changed', [
-                        'from' => $previous,
-                        'to' => $ps['columnsHash'],
-                    ]);
-                }
-            }
-        }
     }
 
     protected function writeCache(array $payload): void

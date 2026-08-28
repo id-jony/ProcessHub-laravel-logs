@@ -82,75 +82,8 @@ Custom redaction keys / patterns live in `config/processhub.php` under `redact.k
 | `processhub:test` | Direct POST (no queue) to verify credentials / network |
 | `processhub:heartbeat` | Single heartbeat ping; auto-scheduled every minute |
 | `processhub:flush-fallback` | Re-ingest batches saved to `storage/logs/processhub-fallback.log` during outages |
-| `processhub:payouts:push` | Incremental push of registered payout rows (auto-scheduled on `payouts.default_cron`) |
 
 You can wire `processhub:flush-fallback` into your own schedule if you want more aggressive retries — the package doesn't schedule it automatically.
-
-## Payouts
-
-When your application is the data source for the ProcessHub Payouts module (tax-agent payout aggregation, see [ProcessHub docs — Payouts module](https://processhub.io/docs/16-payouts-module)), the package can ship payment rows to the same ingest tenant — no extra token, no extra endpoint to configure.
-
-### 1. Register the model
-
-In `app/Providers/AppServiceProvider.php::boot`:
-
-```php
-use ProcessHub\Logs\Payouts\Payouts;
-use App\Models\Payment;
-
-Payouts::register(
-    model: Payment::class,
-    map: fn (Payment $p) => [
-        'gatewayPaymentId'    => (string) $p->id,             // stable dedup key
-        'paymentCreatedAt'    => $p->created_at->toIso8601String(),
-        'rawStatus'           => $p->status_text,             // verbatim, ProcessHub maps it
-        'isCompleted'         => (bool) $p->completed,
-        'isFatalError'        => (bool) $p->fatal_error,
-        'grossAmount'         => (string) $p->amount,         // string to keep кoпейки intact
-
-        // Optional core ↓
-        'externalTxnId'       => $p->transaction_id,
-        'gatewayUpdatedAt'    => $p->updated_at?->toIso8601String(),
-        'errorReason'         => $p->result_message,
-        'recipientPhone'      => $p->phone,
-        'recipientName'       => $p->fio,
-        'recipientMaskedCard' => $p->card_masked,
-
-        // Anything else ProcessHub-side RAW columns may need ↓
-        'rawData' => $p->only(['method', 'tochka', 'service']),
-    ],
-    query: fn ($q) => $q->where('type', 'PR'), // optional scope
-);
-```
-
-That's all the client code change you need. Everything else (HTTP, retries, watermark, observer hookup, scheduler) is wired in the service provider.
-
-### 2. How it ships
-
-| Mode | When | Configured by |
-|---|---|---|
-| **Cron** | `processhub.payouts.default_cron` (overridden by `payoutSource.cadence.cronExpr` from server) | `Schedule` hook in the service provider |
-| **On status change** | Eloquent `created()`/`updated()` events on the registered model | Auto-registered observer when `payoutSource.cadence.mode` ∈ `['on-status-change', 'both']` |
-| **Manual** | `Payouts::push($payment)` / `Payouts::queue($payment)` | Anywhere in your code |
-
-The high-watermark (max `gatewayPaymentId` shipped so far) lives in `storage/app/processhub-payouts-watermark.json`. It survives `cache:clear` and falls back to the server-provided `payoutSource.watermark` hint when missing — bootstrap is safe to restart.
-
-### 3. Env reference
-
-| Env | Default | What |
-|---|---|---|
-| `PROCESSHUB_PAYOUTS_ENABLED` | `true` | Hard kill-switch (server `payoutSource.enabled` overrides) |
-| `PROCESSHUB_PAYOUTS_QUEUE` | `default` | Queue for `PushSinglePayoutJob` (observer-driven) |
-| `PROCESSHUB_PAYOUTS_CONNECTION` | — | Queue connection override |
-| `PROCESSHUB_PAYOUTS_DEFAULT_CRON` | `0 * * * *` | Used until the first heartbeat-config refresh pulls server cadence |
-
-### 4. Failure semantics
-
-- **Server returns 4xx other than 429** → command exits FAILURE, watermark stays put, scheduler email fires. Fix the cause on the ProcessHub side (token, source config, formulas) and the next cron tick resumes.
-- **429 / 5xx** → up to 3 retries with `Retry-After`-aware backoff inside one push; if still failing, watermark stays put and the next cron tick re-tries.
-- **Bad mapper row** (mapper threw `InvalidArgumentException` on shape) → that row is skipped with a `WARNING` log; the rest of the batch ships.
-- **413 Payload Too Large** → batch halved and retried; up to 3 split levels before giving up.
-- **No model registered** → command exits SUCCESS silently with an `INFO` log; observer doesn't bind to anything.
 
 ## How it fails
 
