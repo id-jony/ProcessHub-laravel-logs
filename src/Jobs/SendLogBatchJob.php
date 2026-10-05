@@ -306,7 +306,9 @@ class SendLogBatchJob implements ShouldQueue
         }
 
         $this->delete();
-        Log::warning('ProcessHub log batch moved to the fallback file', [
+        Log::warning(config('processhub.fallback_path')
+            ? 'ProcessHub log batch moved to the fallback file'
+            : 'ProcessHub log batch dropped: fallback file is disabled', [
             'reason' => $reason,
             'entries' => count($this->entries),
         ]);

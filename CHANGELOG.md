@@ -15,6 +15,14 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 
 ### Fixed
 
+- **Remote config timeouts are applied** — `httpTimeoutSeconds` from the
+  remote config used to be written to an unused key; it now sets
+  `timeout_ms` (clamped to 1–20 s, below the job's 30 s timeout), and
+  `flushIntervalSeconds` sets `flush_interval_sec` (0–60 s).
+  `processhub:config:show` shows the correct `listeners.mail` default and the
+  new keys. A batch dropped because the fallback file is disabled is logged as
+  dropped, not as moved.
+
 - **Real batching** — `ProcessHubHandler` buffers entries (new `LogBuffer`
   singleton) and queues one `SendLogBatchJob` per `batch_size` entries
   (capped at 100) / `batch_max_bytes`. In queue workers a partial batch is
