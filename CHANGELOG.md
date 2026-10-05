@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-05
+
+Fixes a production incident: one queued job per log record + attempt-based
+retries on 429 + `JobFailed` logging failures of the delivery job itself
+formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
+
+### Fixed
+
+- **Real batching** — `ProcessHubHandler` buffers entries (new `LogBuffer`
+  singleton) and queues one `SendLogBatchJob` per `batch_size` entries
+  (capped at 100) / `batch_max_bytes`. Flushed on handler `close()`/`reset()`,
+  app `terminating`, `JobProcessed` / `JobFailed` / `JobExceptionOccurred` /
+  `Looping` / `WorkerStopping`, `CommandFinished`.
+- **No feedback loops** — `HandleJobFailed` ignores failures of
+  `SendLogBatchJob`; the handler drops records about its own delivery
+  failures (`DeliveryFailedException`, `MaxAttemptsExceeded`/`TimeoutExceeded`
+  of `SendLogBatchJob`) and records logged while a batch is pushed or
+  delivered. A throwing queue push no longer reaches the app — the batch goes
+  to the fallback file.
+- **429 no longer burns attempts** — `SendLogBatchJob` uses `retryUntil()`
+  (`retry_window_sec`, 1h) instead of `$tries = 3`, `release(Retry-After)` on
+  429, `backoff()` 10/30/120/300 s on 5xx/network, `$maxExceptions = 10`,
+  `$failOnTimeout = true`. 4xx still fails immediately into the fallback file.
+- **`processhub:flush-fallback`** streams the file instead of loading it,
+  packs entries from many lines into full batches, waits out 429, keeps the
+  unsent remainder (temp file + rename) and never sends a line twice unless
+  the process crashes mid-run. New `--limit` and `--max-wait` options.
+
+### Added
+
+- `processhub:rebatch-queue --from=<queue>` — repacks a Redis backlog of
+  single-entry jobs into full batches (atomic chunk claim, crash recovery).
+- Config: `batch_max_bytes` (`PROCESSHUB_LOG_BATCH_MAX_BYTES`, 1800000),
+  `retry_window_sec` (`PROCESSHUB_LOG_RETRY_WINDOW_SEC`, 3600).
+
+### Changed
+
+- `SendLogBatchJob` and `processhub:flush-fallback` use Laravel's HTTP client
+  (`Http`) instead of a raw Guzzle client.
+- `ProcessHubHandler` constructor takes `LogBuffer` instead of the queue
+  factory (only relevant if you construct the handler manually).
+
 ## [0.3.0] — 2026-08-29
 
 ### Removed

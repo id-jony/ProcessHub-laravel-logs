@@ -2,7 +2,6 @@
 
 namespace ProcessHub\Logs\Logging;
 
-use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Monolog\Handler\AbstractProcessingHandler;
 use Monolog\Level;
 use Monolog\LogRecord;
@@ -11,6 +10,10 @@ use ProcessHub\Logs\Redaction\Redactor;
 
 /**
  * Monolog handler which queues log records for async delivery to ProcessHub.
+ *
+ * Records are collected in LogBuffer and shipped as one SendLogBatchJob per
+ * `processhub.batch_size` entries (not one job per record); the buffer is
+ * flushed on close()/reset() and at request/job/command boundaries.
  *
  * Почему queue, а не sync HTTP:
  *   - Ingest endpoint может быть временно недоступен — ретрай через Laravel
@@ -55,7 +58,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
     ];
 
     public function __construct(
-        private readonly QueueFactory $queue,
+        private readonly LogBuffer $buffer,
         Level|int|string $level = Level::Warning,
         bool $bubble = true,
     ) {
@@ -64,6 +67,15 @@ class ProcessHubHandler extends AbstractProcessingHandler
 
     protected function write(LogRecord $record): void
     {
+        // Records produced while delivering logs (queue push, running
+        // SendLogBatchJob) or reporting its failures would feed back into
+        // this very channel — drop them.
+        if ($this->buffer->isMuted()
+            || SendLogBatchJob::isOwnFailure($record->context['exception'] ?? null)
+        ) {
+            return;
+        }
+
         $url = config('processhub.url');
         $token = config('processhub.token');
         if (! $url || ! $token) {
@@ -96,22 +108,22 @@ class ProcessHubHandler extends AbstractProcessingHandler
             }
         }
 
-        $entry = $this->buildEntry($record);
+        $this->buffer->push($this->buildEntry($record));
+    }
 
-        // Push to a dedicated queue so a log firehose doesn't starve the
-        // app's business jobs.
-        $queueName = config('processhub.queue');
-        $connection = config('processhub.connection');
+    public function close(): void
+    {
+        $this->buffer->flush();
+        parent::close();
+    }
 
-        $job = new SendLogBatchJob([$entry]);
-        if ($queueName) {
-            $job->onQueue($queueName);
-        }
-        if ($connection) {
-            $job->onConnection($connection);
-        }
-
-        $this->queue->connection($connection)->pushOn($queueName, $job);
+    /**
+     * Called by Laravel/Octane between units of work on long-lived processes.
+     */
+    public function reset(): void
+    {
+        $this->buffer->flush();
+        parent::reset();
     }
 
     /**

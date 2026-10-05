@@ -2,44 +2,103 @@
 
 namespace ProcessHub\Logs\Jobs;
 
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ClientException;
 use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\SerializesModels;
+use ProcessHub\Logs\Exceptions\DeliveryFailedException;
+use ProcessHub\Logs\Logging\LogBuffer;
+use ProcessHub\Logs\Support\FallbackFile;
+use ProcessHub\Logs\Support\LogIngest;
 
 /**
- * Async delivery of a log batch to ProcessHub.
+ * Async delivery of a log batch (up to 100 entries) to ProcessHub.
  *
- * Retry policy: 3 attempts with exponential backoff (Laravel default).
- * After all attempts are exhausted, `failed()` appends the batch to the
- * fallback file — `processhub:flush-fallback` reads it and re-enqueues
- * later. That way we never lose logs to transient network outages.
+ * Retry policy is time-based, not attempt-based:
+ *   - `retryUntil()` gives the batch `processhub.retry_window_sec` (1h by
+ *     default) to get through. Attempt counters are irrelevant, so a long
+ *     429 streak can't exhaust the job the way `$tries = 3` used to.
+ *   - 429 → `release(Retry-After)`; the job simply waits its turn.
+ *   - 5xx / network → exception, Laravel retries with `backoff()`;
+ *     `$maxExceptions` caps how many real failures we tolerate.
+ *   - 4xx (except 429) is a config problem (bad token, rejected payload) —
+ *     fail immediately, retries won't help.
  *
- * 429 (rate limit) is treated as a retryable error with a delay honouring
- * the Retry-After header — the default Laravel retry wouldn't know to wait
- * the specific number of seconds ProcessHub is asking for.
- *
- * 401 (invalid token) is a DEV-config problem, not a transient error — we
- * fail immediately and let the fallback file capture the batch so an admin
- * can re-ingest after fixing config.
+ * Whatever ends up failing (window expired, too many exceptions, timeout,
+ * 4xx) lands in the fallback file via `failed()`;
+ * `processhub:flush-fallback` re-ingests it later.
  */
 class SendLogBatchJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /** Laravel retry attempts. */
-    public int $tries = 3;
-
     /** Max time in seconds a single attempt can run. */
     public int $timeout = 30;
+
+    /** A timed-out attempt goes to `failed()` instead of being retried blindly. */
+    public bool $failOnTimeout = true;
+
+    /** 5xx / network failures tolerated within the retry window. */
+    public int $maxExceptions = 10;
 
     public function __construct(
         /** @var array<int, array<string, mixed>> */
         public array $entries,
     ) {}
+
+    /**
+     * Push a batch to the configured connection/queue.
+     *
+     * @param  array<int, array<string, mixed>>  $entries
+     */
+    public static function enqueue(array $entries): void
+    {
+        $queueName = config('processhub.queue');
+        $connection = config('processhub.connection');
+
+        $job = new self($entries);
+        if ($queueName) {
+            $job->onQueue($queueName);
+        }
+        if ($connection) {
+            $job->onConnection($connection);
+        }
+
+        app(QueueFactory::class)->connection($connection)->pushOn($queueName, $job);
+    }
+
+    /**
+     * True when the throwable describes a failure of log delivery itself —
+     * such reports must not be logged back into the ProcessHub channel.
+     */
+    public static function isOwnFailure(mixed $e): bool
+    {
+        if ($e instanceof DeliveryFailedException) {
+            return true;
+        }
+
+        // Covers TimeoutExceededException too (it extends this class).
+        return $e instanceof MaxAttemptsExceededException
+            && isset($e->job)
+            && $e->job->resolveName() === static::class;
+    }
+
+    public function retryUntil(): \DateTimeInterface
+    {
+        return now()->addSeconds(max(60, (int) config('processhub.retry_window_sec', 3600)));
+    }
+
+    /**
+     * @return array<int, int>
+     */
+    public function backoff(): array
+    {
+        return [10, 30, 120, 300];
+    }
 
     public function handle(): void
     {
@@ -49,38 +108,9 @@ class SendLogBatchJob implements ShouldQueue
             return;
         }
 
-        $timeoutSec = max(1, (int) config('processhub.timeout_ms', 5000) / 1000);
-
-        $client = new Client([
-            'base_uri' => rtrim($url, '/'),
-            'timeout' => $timeoutSec,
-            'http_errors' => true,
-        ]);
-
-        try {
-            $client->post('/api/ingest/logs', [
-                'headers' => [
-                    'Authorization' => "Bearer {$token}",
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => ['logs' => $this->entries],
-            ]);
-        } catch (ClientException $e) {
-            $status = $e->getResponse()?->getStatusCode();
-            // 429 — honour Retry-After; release back to the queue with a delay.
-            if ($status === 429) {
-                $retryAfter = (int) ($e->getResponse()?->getHeaderLine('Retry-After') ?: 30);
-                $this->release($retryAfter);
-                return;
-            }
-            // 4xx (except 429) means config is wrong — don't waste retries.
-            if ($status >= 400 && $status < 500) {
-                $this->fail($e);
-                return;
-            }
-            // 5xx / network — bubble up so Laravel retries with backoff.
-            throw $e;
-        }
+        // Anything logged while delivering (HTTP client, listeners of fail())
+        // must not be buffered into yet another batch.
+        app(LogBuffer::class)->mute(fn () => $this->deliver($url, $token));
     }
 
     /**
@@ -89,18 +119,35 @@ class SendLogBatchJob implements ShouldQueue
      */
     public function failed(\Throwable $exception): void
     {
-        $path = config('processhub.fallback_path');
-        if (! $path) {
+        FallbackFile::append($this->entries, $exception->getMessage());
+    }
+
+    private function deliver(string $url, string $token): void
+    {
+        try {
+            $response = LogIngest::post($url, $token, $this->entries);
+        } catch (ConnectionException $e) {
+            throw DeliveryFailedException::network($e);
+        }
+
+        if ($response->successful()) {
             return;
         }
-        @file_put_contents(
-            $path,
-            json_encode([
-                'failed_at' => now()->toIso8601String(),
-                'reason' => $exception->getMessage(),
-                'entries' => $this->entries,
-            ]) . "\n",
-            FILE_APPEND | LOCK_EX,
-        );
+
+        $status = $response->status();
+
+        if ($status === 429) {
+            $this->release(LogIngest::retryAfter($response));
+
+            return;
+        }
+
+        if ($status >= 400 && $status < 500) {
+            $this->fail(DeliveryFailedException::status($status, $response->body()));
+
+            return;
+        }
+
+        throw DeliveryFailedException::status($status);
     }
 }

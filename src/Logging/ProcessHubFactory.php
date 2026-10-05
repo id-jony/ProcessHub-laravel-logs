@@ -2,7 +2,6 @@
 
 namespace ProcessHub\Logs\Logging;
 
-use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Monolog\Level;
 use Monolog\Logger;
 
@@ -22,7 +21,7 @@ class ProcessHubFactory
     {
         $level = $this->resolveLevel($config['level'] ?? 'warning');
         $handler = new ProcessHubHandler(
-            app(QueueFactory::class),
+            app(LogBuffer::class),
             $level,
         );
 

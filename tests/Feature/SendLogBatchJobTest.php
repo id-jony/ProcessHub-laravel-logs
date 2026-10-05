@@ -7,6 +7,11 @@ use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Psr7\Response as GuzzleResponse;
 use GuzzleHttp\Psr7\Request as GuzzleRequest;
+use Illuminate\Contracts\Queue\Job;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\Http;
+use Mockery;
+use ProcessHub\Logs\Exceptions\DeliveryFailedException;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Tests\TestCase;
 
@@ -114,5 +119,87 @@ class SendLogBatchJobTest extends TestCase
         ]);
         $stack = HandlerStack::create($mock);
         $this->assertNotNull($stack);
+    }
+
+    public function test_successful_delivery_posts_whole_batch(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['accepted' => 2])]);
+        $job = $this->jobWithQueueMock([['message' => 'a'], ['message' => 'b']], function ($queueJob) {
+            $queueJob->shouldNotReceive('release');
+            $queueJob->shouldNotReceive('fail');
+        });
+
+        $job->handle();
+
+        Http::assertSent(fn ($request) => $request->url() === 'https://ph.test/api/ingest/logs'
+            && count($request['logs']) === 2
+            && $request->hasHeader('Authorization'));
+    }
+
+    public function test_rate_limit_releases_with_retry_after_regardless_of_attempts(): void
+    {
+        Http::fake(['ph.test/*' => Http::response('', 429, ['Retry-After' => '17'])]);
+        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) {
+            $queueJob->allows('attempts')->andReturn(50);
+            $queueJob->shouldReceive('release')->once()->with(17);
+            $queueJob->shouldNotReceive('fail');
+        });
+
+        $job->handle();
+    }
+
+    public function test_retry_policy_is_time_based(): void
+    {
+        config()->set('processhub.retry_window_sec', 3600);
+        $job = new SendLogBatchJob([]);
+
+        $this->assertFalse(property_exists($job, 'tries'), 'attempt cap would let 429 exhaust the job');
+        $this->assertEqualsWithDelta(now()->addHour()->getTimestamp(), $job->retryUntil()->getTimestamp(), 5);
+        $this->assertSame([10, 30, 120, 300], $job->backoff());
+        $this->assertTrue($job->failOnTimeout);
+    }
+
+    public function test_server_error_throws_for_backoff_retry(): void
+    {
+        Http::fake(['ph.test/*' => Http::response('', 503)]);
+        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) {
+            $queueJob->shouldNotReceive('release');
+        });
+
+        $this->expectException(DeliveryFailedException::class);
+        $job->handle();
+    }
+
+    public function test_network_error_throws_delivery_exception(): void
+    {
+        Http::fake(fn () => throw new ConnectionException('Connection refused'));
+        $job = new SendLogBatchJob([['message' => 'a']]);
+
+        $this->expectException(DeliveryFailedException::class);
+        $job->handle();
+    }
+
+    public function test_client_error_fails_immediately(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) {
+            $queueJob->shouldReceive('fail')->once()->with(Mockery::type(DeliveryFailedException::class));
+            $queueJob->shouldNotReceive('release');
+        });
+
+        $job->handle();
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $entries
+     */
+    private function jobWithQueueMock(array $entries, callable $expectations): SendLogBatchJob
+    {
+        $queueJob = Mockery::mock(Job::class);
+        $expectations($queueJob);
+        $job = new SendLogBatchJob($entries);
+        $job->setJob($queueJob);
+
+        return $job;
     }
 }

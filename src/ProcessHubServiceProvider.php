@@ -2,9 +2,15 @@
 
 namespace ProcessHub\Logs;
 
+use Illuminate\Console\Events\CommandFinished;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Queue\Events\JobExceptionOccurred;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Support\ServiceProvider;
 use ProcessHub\Logs\Commands\ConfigRefreshCommand;
 use ProcessHub\Logs\Commands\ConfigShowCommand;
@@ -12,9 +18,11 @@ use ProcessHub\Logs\Commands\DeployCommand;
 use ProcessHub\Logs\Commands\FlushFallbackCommand;
 use ProcessHub\Logs\Commands\HeartbeatCommand;
 use ProcessHub\Logs\Commands\InstallCommand;
+use ProcessHub\Logs\Commands\RebatchQueueCommand;
 use ProcessHub\Logs\Commands\TestCommand;
 use ProcessHub\Logs\Config\RemoteConfigClient;
 use ProcessHub\Logs\Listeners\HandleExceptionReported;
+use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Middleware\CorrelateRequestId;
 
 class ProcessHubServiceProvider extends ServiceProvider
@@ -33,6 +41,9 @@ class ProcessHubServiceProvider extends ServiceProvider
         // Remote-config client — singleton because it caches state across
         // the request lifecycle and heartbeat ticks.
         $this->app->singleton(RemoteConfigClient::class);
+
+        // Per-process buffer of log entries awaiting a SendLogBatchJob.
+        $this->app->singleton(LogBuffer::class);
     }
 
     public function boot(): void
@@ -52,6 +63,7 @@ class ProcessHubServiceProvider extends ServiceProvider
                 ConfigRefreshCommand::class,
                 ConfigShowCommand::class,
                 DeployCommand::class,
+                RebatchQueueCommand::class,
             ]);
         }
 
@@ -85,6 +97,9 @@ class ProcessHubServiceProvider extends ServiceProvider
         // 5. Register Laravel event listeners (QueryExecuted, JobFailed, …).
         $this->registerEventListeners();
 
+        // 5a. Flush buffered log entries at every unit-of-work boundary.
+        $this->registerBufferFlushHooks();
+
         // 6. Auto-capture uncaught exceptions through the Handler's
         //    reportable() hook — the user doesn't need to manually wrap
         //    exceptions into Log::error() calls.
@@ -97,6 +112,32 @@ class ProcessHubServiceProvider extends ServiceProvider
                 // user must wire Log::error manually. Don't crash boot.
             }
         });
+    }
+
+    /**
+     * Registered after registerEventListeners() so the flush on JobFailed
+     * runs after HandleJobFailed has logged the failure. `Looping` and
+     * `WorkerStopping` catch records written after the job events (e.g. the
+     * worker reporting a job exception).
+     */
+    protected function registerBufferFlushHooks(): void
+    {
+        $flush = function (): void {
+            // Don't instantiate the buffer just to find it empty.
+            if ($this->app->resolved(LogBuffer::class)) {
+                $this->app->make(LogBuffer::class)->flush();
+            }
+        };
+
+        $this->app->terminating($flush);
+        $this->app['events']->listen([
+            JobProcessed::class,
+            JobFailed::class,
+            JobExceptionOccurred::class,
+            Looping::class,
+            WorkerStopping::class,
+            CommandFinished::class,
+        ], $flush);
     }
 
     protected function registerEventListeners(): void

@@ -25,13 +25,20 @@ return [
     |            очередь ('logs') чтобы всплески не блокировали business jobs.
     | connection — connection имя, обычно 'redis' или 'database'.
     | batch_size — сколько событий отправлять одним запросом (до 100 по
-    |              контракту ProcessHub).
+    |              контракту ProcessHub). Handler копит записи в памяти и
+    |              ставит одну задачу на пачку.
+    | batch_max_bytes — потолок JSON-размера пачки (сервер принимает до 2 МБ).
     | timeout_ms — сколько ждать HTTP-ответа.
+    | retry_window_sec — сколько секунд SendLogBatchJob пытается доставить
+    |              пачку (429 ждёт Retry-After и попыток не тратит), потом —
+    |              fallback-файл.
     */
     'queue' => env('PROCESSHUB_LOG_QUEUE', 'logs'),
     'connection' => env('PROCESSHUB_LOG_CONNECTION', null),
     'batch_size' => (int) env('PROCESSHUB_LOG_BATCH_SIZE', 100),
+    'batch_max_bytes' => (int) env('PROCESSHUB_LOG_BATCH_MAX_BYTES', 1800000),
     'timeout_ms' => (int) env('PROCESSHUB_LOG_TIMEOUT_MS', 5000),
+    'retry_window_sec' => (int) env('PROCESSHUB_LOG_RETRY_WINDOW_SEC', 3600),
 
     /*
     |--------------------------------------------------------------------------

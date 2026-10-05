@@ -24,6 +24,12 @@ jobs:
 
     name: PHP ${{ matrix.php }} · Laravel ${{ matrix.laravel }}
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +54,8 @@ jobs:
 
       - name: Run tests
         run: vendor/bin/phpunit --colors=always
+        env:
+          PROCESSHUB_TEST_REDIS_HOST: 127.0.0.1
 
   static-analysis:
     runs-on: ubuntu-latest
