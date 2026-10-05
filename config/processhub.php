@@ -28,6 +28,10 @@ return [
     |              контракту ProcessHub). Handler копит записи в памяти и
     |              ставит одну задачу на пачку.
     | batch_max_bytes — потолок JSON-размера пачки (сервер принимает до 2 МБ).
+    | flush_interval_sec — сколько секунд неполная пачка ждёт в памяти
+    |              долгоживущего процесса (queue-воркер, демон), прежде чем
+    |              уйти в очередь. Конец HTTP-запроса / команды / воркера
+    |              отправляет пачку сразу.
     | timeout_ms — сколько ждать HTTP-ответа.
     | retry_window_sec — сколько секунд SendLogBatchJob пытается доставить
     |              пачку (429 ждёт Retry-After и попыток не тратит), потом —
@@ -37,6 +41,7 @@ return [
     'connection' => env('PROCESSHUB_LOG_CONNECTION', null),
     'batch_size' => (int) env('PROCESSHUB_LOG_BATCH_SIZE', 100),
     'batch_max_bytes' => (int) env('PROCESSHUB_LOG_BATCH_MAX_BYTES', 1800000),
+    'flush_interval_sec' => (int) env('PROCESSHUB_LOG_FLUSH_INTERVAL_SEC', 10),
     'timeout_ms' => (int) env('PROCESSHUB_LOG_TIMEOUT_MS', 5000),
     'retry_window_sec' => (int) env('PROCESSHUB_LOG_RETRY_WINDOW_SEC', 3600),
 

@@ -25,6 +25,7 @@ class HandleJobFailedTest extends TestCase
         Queue::fake();
 
         event(new JobFailed('redis', $this->job('App\\Jobs\\SendReceipt'), new \RuntimeException('boom')));
+        $this->app->terminate();
 
         Queue::assertPushed(SendLogBatchJob::class, function (SendLogBatchJob $job) {
             return count($job->entries) === 1
