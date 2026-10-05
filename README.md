@@ -157,7 +157,7 @@ Versions < 0.4 queued one job per log record; a stuck ingest could leave million
     php artisan processhub:flush-fallback --rate=40 --max-runtime=5400
     ```
     `Ctrl-C` stops cleanly; the next run resumes from the checkpoint. Then add the [scheduled flush](#processhubflush-fallback).
-5. **Clean up failed-job records**: `php artisan processhub:forget-failed --dry-run` to count, then `php artisan processhub:forget-failed` — or with `--to-fallback` if some of those batches never made it into the fallback file (already delivered entries are then sent again), followed by another `flush-fallback`. Horizon also expires them by itself after `horizon.trim.failed`.
+5. **Clean up failed-job records** (0.3 jobs that had already used up their 3 attempts are failed by the worker before they run — their batch goes to the fallback file and a record stays in `failed_jobs`/Horizon): `php artisan processhub:forget-failed --dry-run` to count, then `php artisan processhub:forget-failed` — or with `--to-fallback` if some of those batches never made it into the fallback file (already delivered entries are then sent again), followed by another `flush-fallback`. Horizon also expires them by itself after `horizon.trim.failed`.
 
 ## How it fails
 

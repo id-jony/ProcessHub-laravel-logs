@@ -41,6 +41,14 @@ class LogBuffer
     /** Memory allowed past an exhausted memory_limit to ship the buffer. */
     private const SHUTDOWN_EXTRA_MEMORY = 16 * 1024 * 1024;
 
+    /**
+     * Freed first thing when a fatal error reaches the package: room to build
+     * and ship the entry when memory runs out in small allocations.
+     */
+    private const RESERVED_MEMORY = 256 * 1024;
+
+    private static ?string $reservedMemory = null;
+
     private ?BatchBuilder $batch = null;
 
     /** Unix time of the oldest buffered entry. */
@@ -252,16 +260,19 @@ class LogBuffer
      */
     private static function prepareForFatalError(): void
     {
+        self::$reservedMemory ??= str_repeat("\0", self::RESERVED_MEMORY);
         class_exists(FatalError::class);
         class_exists(Unlimited::class);
     }
 
     /**
-     * Sentry's approach: on "Allowed memory size … exhausted" raise
-     * memory_limit so the buffer can still be shipped.
+     * Sentry's approach: drop our reserve and, on "Allowed memory size …
+     * exhausted", raise memory_limit so the buffer can still be shipped.
      */
     private static function reclaimMemory(): void
     {
+        self::$reservedMemory = null;
+
         $error = error_get_last();
         if ($error === null
             || preg_match('/^Allowed memory size of (\d+) bytes exhausted/', $error['message'], $m) !== 1
@@ -272,8 +283,7 @@ class LogBuffer
         $limit = (int) $m[1] + self::SHUTDOWN_EXTRA_MEMORY;
         // Лимит ниже текущего потребления ini_set не примет, а его warning
         // обработчик Laravel превратит в исключение; php_admin_value не
-        // поднять вовсе — тогда пачка не уйдёт (резерв памяти тут не спасает:
-        // его съедают запись в другие каналы и рендер ошибки).
+        // поднять вовсе — тогда остаётся только освобождённый резерв.
         if ($limit > memory_get_usage(true)) {
             @ini_set('memory_limit', (string) $limit);
         }
