@@ -17,34 +17,81 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 
 - **Real batching** — `ProcessHubHandler` buffers entries (new `LogBuffer`
   singleton) and queues one `SendLogBatchJob` per `batch_size` entries
-  (capped at 100) / `batch_max_bytes`. Flushed on handler `close()`/`reset()`,
-  app `terminating`, `JobProcessed` / `JobFailed` / `JobExceptionOccurred` /
-  `Looping` / `WorkerStopping`, `CommandFinished`.
-- **No feedback loops** — `HandleJobFailed` ignores failures of
-  `SendLogBatchJob`; the handler drops records about its own delivery
-  failures (`DeliveryFailedException`, `MaxAttemptsExceeded`/`TimeoutExceeded`
-  of `SendLogBatchJob`) and records logged while a batch is pushed or
-  delivered. A throwing queue push no longer reaches the app — the batch goes
-  to the fallback file.
-- **429 no longer burns attempts** — `SendLogBatchJob` uses `retryUntil()`
-  (`retry_window_sec`, 1h) instead of `$tries = 3`, `release(Retry-After)` on
-  429, `backoff()` 10/30/120/300 s on 5xx/network, `$maxExceptions = 10`,
-  `$failOnTimeout = true`. 4xx still fails immediately into the fallback file.
+  (capped at 100) / `batch_max_bytes`. In queue workers a partial batch is
+  shipped by age (`flush_interval_sec`, 10 s; checked on push, `JobProcessed`,
+  `JobFailed`, `Looping`), not after every job. Full flush on app
+  `terminating`, `CommandFinished`, `WorkerStopping`, Octane
+  `RequestTerminated`, handler `close()`/`reset()` and in a shutdown function
+  — fatal errors (OOM, `max_execution_time`) deliver both the buffer and the
+  `FatalError`. `SIGKILL` still loses the unsent buffer. A child after
+  `pcntl_fork()` drops the inherited buffer instead of resending it.
+- **No feedback loops** — the buffer is muted while a worker processes a
+  `SendLogBatchJob` (until the next job / loop tick / worker stop), so the
+  worker reporting its exception can't create a new batch; `HandleJobFailed`
+  ignores failures of `SendLogBatchJob`; the handler drops reports of its own
+  delivery failures. A throwing queue push no longer reaches the app — the
+  batch goes to the fallback file.
+- **One entry per exception** — the same exception object is shipped once,
+  even with `processhub` in the default `stack`.
+- **No Sentry/daily spam** — `DeliveryFailedException` is excluded from
+  exception reporting (`dontReportWhen()` on Laravel 12, which also covers
+  `MaxAttemptsExceeded`/`TimeoutExceeded` of `SendLogBatchJob`; `ignore()` on
+  Laravel 11 and older).
+- **429 no longer burns attempts** — `SendLogBatchJob` retries by time only:
+  `retryUntil()` = `retry_window_sec` (1h) from the moment the batch is due,
+  no `$tries`/`$maxExceptions`. `Retry-After` (seconds or HTTP-date, clamped
+  to 1–600 s, 30 s when missing) on 429, `backoff()` 10/30/120/300 s on
+  5xx / network, `$failOnTimeout = true`.
+- **Every transport error is a delivery failure** — connect, reset, TLS,
+  HTTP/2 (e.g. cURL 55/56/60/92 that Laravel < 12 passed through unwrapped)
+  → `DeliveryFailedException` and a regular retry.
+- **Bad values don't sink a batch** — `INF`/`NaN` and broken UTF-8 are
+  substituted when encoding.
+- **Dead ends go to the fallback file, not `failed_jobs`** — 4xx (except
+  429) or a retry that wouldn't fit before the deadline appends the batch to
+  the fallback file and deletes the job. `failed()` stays for timeouts and
+  jobs picked up after their deadline.
 - **Exceptions in context reach ProcessHub again** — `ProcessHubHandler`
   extracts the `Throwable` before `Redactor` runs (it used to turn the
   exception object into `[]`, so class/message/stack trace were lost).
   Message and trace are still masked by `Redactor`.
-- **`processhub:flush-fallback`** streams the file instead of loading it,
-  packs entries from many lines into full batches, waits out 429, keeps the
-  unsent remainder (temp file + rename) and never sends a line twice unless
-  the process crashes mid-run. New `--limit` and `--max-wait` options.
+- **`processhub:flush-fallback`** streams the file instead of loading it and
+  packs entries from many lines into full batches. The live file is taken
+  over as a snapshot `<path>.flushing` under the lock `<path>.write.lock`
+  shared with appends; the snapshot is never rewritten, progress goes to
+  `<path>.flushing.offset` (after `kill -9` at most one batch is resent).
+  Requests are paced by `--rate` and the shared limiter, 429 is waited out up
+  to `--max-wait`, every pause is ≥ 1 s. A batch refused with 4xx (except
+  401/403/404/405/408/429) is split in halves; single refused entries go to
+  `<path>.rejected` with the reason (`cat <path>.rejected >> <path>` to
+  retry). 401/403/404/405 or 5 temporary failures in a row (backoff
+  2–16 s) stop the run with exit code 1, nothing skipped. A
+  `<path>.flushing.tmp` left by an earlier build is no longer used — delete
+  it by hand.
 
 ### Added
 
-- `processhub:rebatch-queue --from=<queue>` — repacks a Redis backlog of
-  single-entry jobs into full batches (atomic chunk claim, crash recovery).
+- `IngestThrottle` — rate limit for ingest POSTs shared by all workers and
+  `processhub:flush-fallback` through a cache store; a 429 pauses every
+  sender.
+- `processhub:rebatch-queue --from=<queue> [--chunk] [--limit] [--rate]
+  [--start-delay]` — repacks a Redis backlog of single-entry jobs into full
+  batches (atomic chunk claim, crash recovery). Batches are spread at
+  `--rate` per minute (default `rate_limit_per_minute`, `0` = all at once)
+  after what already sits in the target queue, each with a full retry window
+  from its due time; `queues:<from>:notify` is deleted once the backlog is
+  drained. Prepare the backlog with `RENAMENX` of `queues:logs` and
+  `queues:logs:notify`.
+- `processhub:flush-fallback` options `--limit`, `--max-wait`, `--rate`
+  (default `rate_limit_per_minute`), `--max-runtime` (300).
+- `SendLogBatchJob::enqueue($entries, $delaySeconds = 0)`; the delay shifts
+  the retry deadline.
 - Config: `batch_max_bytes` (`PROCESSHUB_LOG_BATCH_MAX_BYTES`, 1800000),
-  `retry_window_sec` (`PROCESSHUB_LOG_RETRY_WINDOW_SEC`, 3600).
+  `flush_interval_sec` (`PROCESSHUB_LOG_FLUSH_INTERVAL_SEC`, 10),
+  `retry_window_sec` (`PROCESSHUB_LOG_RETRY_WINDOW_SEC`, 3600),
+  `rate_limit_per_minute` (`PROCESSHUB_RATE_LIMIT_PER_MINUTE`, 50, `0` = off),
+  `rate_limit_store` (`PROCESSHUB_RATE_LIMIT_STORE`, default cache store;
+  must be shared — redis / database).
 
 ### Changed
 
@@ -52,6 +99,10 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   (`Http`) instead of a raw Guzzle client.
 - `ProcessHubHandler` constructor takes `LogBuffer` instead of the queue
   factory (only relevant if you construct the handler manually).
+- `Queue job failed` entries are now shipped with their exception:
+  `contextType=exception` and `context.class` is the exception class, not the
+  job class (the job class is no longer in the entry; `connection`, `queue`,
+  `attempts` are kept).
 
 ## [0.3.0] — 2026-08-29
 

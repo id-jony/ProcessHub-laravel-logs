@@ -6,6 +6,7 @@ use Carbon\CarbonInterval;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Sleep;
 use ProcessHub\Logs\Support\FallbackFile;
@@ -69,11 +70,25 @@ class FlushFallbackCommandTest extends TestCase
         $this->assertSame([2.0, 2.0], $this->slept);
 
         $this->slept = [];
+        // Слоты общего лимитера пережили бы первый запуск: время в тесте не идёт.
+        Cache::flush();
         config()->set('processhub.rate_limit_per_minute', 20);
         $this->writeFallback(lines: 2, perLine: 100);
 
         $this->artisan('processhub:flush-fallback')->assertSuccessful();
         $this->assertSame([3.0], $this->slept);
+    }
+
+    public function test_zero_rate_disables_local_pacing(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
+        config()->set('processhub.rate_limit_per_minute', 0);
+        $this->writeFallback(lines: 3, perLine: 100);
+
+        $this->artisan('processhub:flush-fallback', ['--rate' => 0])->assertSuccessful();
+
+        $this->assertSame([], $this->slept);
+        $this->assertCount(3, Http::recorded());
     }
 
     public function test_rate_limit_waits_for_retry_after_and_continues(): void

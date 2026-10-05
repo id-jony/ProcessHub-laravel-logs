@@ -69,11 +69,12 @@ final class LogIngest
     {
         $header = trim($response->header('Retry-After'));
 
-        if (ctype_digit($header)) {
+        if (preg_match('/^-?\d+$/', $header)) {
             $seconds = (int) $header;
+        } elseif ($header !== '' && ($at = strtotime($header)) !== false) {
+            $seconds = $at - now()->getTimestamp();
         } else {
-            $at = $header === '' ? false : strtotime($header);
-            $seconds = $at === false ? self::DEFAULT_RETRY_AFTER : $at - now()->getTimestamp();
+            $seconds = self::DEFAULT_RETRY_AFTER;
         }
 
         return max(self::MIN_RETRY_AFTER, min(self::MAX_RETRY_AFTER, $seconds));

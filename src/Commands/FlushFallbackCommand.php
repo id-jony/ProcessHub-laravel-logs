@@ -8,6 +8,7 @@ use Illuminate\Http\Client\Response;
 use Illuminate\Support\Sleep;
 use ProcessHub\Logs\Support\BatchBuilder;
 use ProcessHub\Logs\Support\FallbackFile;
+use ProcessHub\Logs\Support\IngestThrottle;
 use ProcessHub\Logs\Support\LogIngest;
 
 /**
@@ -44,18 +45,10 @@ class FlushFallbackCommand extends Command
     protected $signature = 'processhub:flush-fallback
         {--limit= : Max batches to send in this run}
         {--max-wait=120 : Max seconds to honour a single Retry-After before giving up}
-        {--rate= : Max requests per minute (default: processhub.rate_limit_per_minute, 50)}
+        {--rate= : Max requests per minute (default: processhub.rate_limit_per_minute, 50; 0 = no local pacing)}
         {--max-runtime=300 : Stop after this many seconds, keeping the remainder for the next run}';
 
     protected $description = 'Re-ingest batches previously saved to the fallback file';
-
-    /** Минимальная пауза перед повтором — Retry-After: 0 не должен давать цикл без пауз. */
-    private const MIN_PAUSE = 1;
-
-    /** Пауза на 429 без пригодного Retry-After. */
-    private const DEFAULT_RETRY_AFTER = 30;
-
-    private const MAX_RETRY_AFTER = 3600;
 
     private const MAX_BACKOFF = 60;
 
@@ -73,6 +66,8 @@ class FlushFallbackCommand extends Command
     private int $intervalMs;
 
     private int $deadlineMs;
+
+    private IngestThrottle $throttle;
 
     private ?int $lastPostMs = null;
 
@@ -112,8 +107,10 @@ class FlushFallbackCommand extends Command
         $this->url = $url;
         $this->token = $token;
 
+        $this->throttle = IngestThrottle::make();
         $rate = (int) ($this->option('rate') ?? config('processhub.rate_limit_per_minute', 50));
-        $this->intervalMs = (int) ceil(60_000 / max(1, $rate));
+        // 0 — без локального темпа, остаётся только общий IngestThrottle.
+        $this->intervalMs = $rate > 0 ? (int) ceil(60_000 / $rate) : 0;
         $this->deadlineMs = $this->nowMs() + max(1, (int) $this->option('max-runtime')) * 1000;
 
         $lock = fopen($path . '.lock', 'c');
@@ -385,7 +382,7 @@ class FlushFallbackCommand extends Command
 
     private function rateLimited(Response $response): bool
     {
-        $wait = $this->retryAfter($response);
+        $wait = LogIngest::retryAfter($response);
         if ($wait > (int) $this->option('max-wait')) {
             $this->warn("Rate limited, Retry-After {$wait}s exceeds --max-wait — stopping.");
             return false;
@@ -393,26 +390,9 @@ class FlushFallbackCommand extends Command
 
         $this->line("Rate limited — waiting {$wait}s (sent {$this->sent} batches so far)…");
         $this->pauseFor($wait);
+        $this->throttle->pauseFor($wait);
 
         return true;
-    }
-
-    /**
-     * `Retry-After` в секундах или HTTP-date; не меньше MIN_PAUSE.
-     */
-    private function retryAfter(Response $response): int
-    {
-        $header = trim($response->header('Retry-After'));
-
-        if (preg_match('/^-?\d+$/', $header)) {
-            $seconds = (int) $header;
-        } elseif ($header !== '' && ($at = strtotime($header)) !== false) {
-            $seconds = $at - now()->getTimestamp();
-        } else {
-            $seconds = self::DEFAULT_RETRY_AFTER;
-        }
-
-        return max(self::MIN_PAUSE, min(self::MAX_RETRY_AFTER, $seconds));
     }
 
     private function pauseFor(int $seconds): void
@@ -434,6 +414,13 @@ class FlushFallbackCommand extends Command
         $next = $this->lastPostMs === null ? 0 : $this->lastPostMs + $this->intervalMs;
         if (! $this->sleepUntil(max($this->notBeforeMs, $next))) {
             return false;
+        }
+
+        // Общий лимит токена: те же слоты делят воркеры SendLogBatchJob.
+        while (($wait = $this->throttle->acquire()) > 0) {
+            if (! $this->sleepUntil($this->nowMs() + $wait * 1000)) {
+                return false;
+            }
         }
 
         $this->lastPostMs = $this->nowMs();
