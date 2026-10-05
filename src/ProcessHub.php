@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\Facade;
  * The real implementation lives in {@see ProcessHubManager} (separate file
  * so PSR-4 autoloading resolves it for typed DI in commands/jobs/listeners).
  *
- * @method static bool markDeploy(string $version, ?string $commitSha = null, bool $success = true, ?array $metadata = null)
+ * @method static bool markDeploy(string $version, ?string $commitSha = null, bool $success = true, ?array<string, mixed> $metadata = null)
  */
 class ProcessHub extends Facade
 {

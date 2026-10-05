@@ -1,0 +1,82 @@
+<?php
+
+/**
+ * Run by FatalErrorFlushTest in a separate PHP process: boots the package,
+ * writes a log record and dies ($argv[1]: memory-large |
+ * timeout | uncaught). Jobs land in the sqlite database $argv[2]. With
+ * $argv[3] = "unreported" Laravel's exception handler ignores FatalError.
+ */
+
+use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use Orchestra\Testbench\Foundation\Application;
+use ProcessHub\Logs\Logging\ProcessHubFactory;
+use ProcessHub\Logs\ProcessHubServiceProvider;
+use Symfony\Component\ErrorHandler\Error\FatalError;
+
+require __DIR__ . '/../../vendor/autoload.php';
+
+[, $mode, $database] = $argv;
+$unreported = ($argv[3] ?? null) === 'unreported';
+
+Application::create(options: ['extra' => [
+    'providers' => [ProcessHubServiceProvider::class],
+    'dont-discover' => ['*'],
+]]);
+
+config([
+    'database.default' => 'jobs',
+    'database.connections.jobs' => ['driver' => 'sqlite', 'database' => $database, 'prefix' => ''],
+    'queue.default' => 'database',
+    'queue.connections.database' => [
+        'driver' => 'database', 'connection' => 'jobs', 'table' => 'jobs', 'queue' => 'default', 'retry_after' => 90,
+    ],
+    'logging.default' => 'stack',
+    // As in production: a file channel is written before processhub.
+    'logging.channels.single' => ['driver' => 'single', 'path' => $database . '.laravel.log', 'level' => 'debug'],
+    'logging.channels.stack' => ['driver' => 'stack', 'channels' => ['single', 'processhub']],
+    'logging.channels.processhub' => ['driver' => 'custom', 'via' => ProcessHubFactory::class, 'level' => 'debug'],
+    'processhub.url' => 'https://ph.test',
+    'processhub.token' => 'ph_live_test_test_00000000000000000000000000000000',
+    'processhub.connection' => 'database',
+    'processhub.queue' => 'logs',
+    'processhub.fallback_path' => $database . '.fallback.log',
+]);
+
+Schema::create('jobs', function (Blueprint $table) {
+    $table->id();
+    $table->string('queue')->index();
+    $table->longText('payload');
+    $table->unsignedTinyInteger('attempts');
+    $table->unsignedInteger('reserved_at')->nullable();
+    $table->unsignedInteger('available_at');
+    $table->unsignedInteger('created_at');
+});
+
+if ($unreported) {
+    app(ExceptionHandler::class)->ignore(FatalError::class);
+}
+
+// Registered after the package: still has to be shipped.
+register_shutdown_function(fn () => Log::warning('late shutdown'));
+
+Log::warning('before fatal');
+
+if (str_starts_with($mode, 'memory')) {
+    ini_set('memory_limit', (string) (memory_get_usage() + 16 * 1024 * 1024));
+    $hog = [];
+    while (true) {
+        $hog[] = str_repeat('x', 1024 * 1024);
+    }
+}
+
+if ($mode === 'timeout') {
+    set_time_limit(1);
+    while (true) {
+        // Busy loop until max_execution_time.
+    }
+}
+
+throw new RuntimeException('uncaught in script');

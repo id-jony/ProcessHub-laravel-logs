@@ -3,7 +3,6 @@
 namespace ProcessHub\Logs;
 
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\ClientException;
 
 /**
  * Real implementation behind the `ProcessHub` facade.
@@ -63,7 +62,7 @@ class ProcessHubManager
                 ], static fn ($v) => $v !== null),
             ]);
             return $res->getStatusCode() >= 200 && $res->getStatusCode() < 300;
-        } catch (ClientException | \Throwable) {
+        } catch (\Throwable) {
             return false;
         }
     }

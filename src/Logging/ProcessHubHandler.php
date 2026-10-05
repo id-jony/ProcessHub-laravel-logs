@@ -2,15 +2,19 @@
 
 namespace ProcessHub\Logs\Logging;
 
-use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Monolog\Handler\AbstractProcessingHandler;
 use Monolog\Level;
 use Monolog\LogRecord;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Redaction\Redactor;
+use Symfony\Component\ErrorHandler\Error\FatalError;
 
 /**
  * Monolog handler which queues log records for async delivery to ProcessHub.
+ *
+ * Records are collected in LogBuffer and shipped as one SendLogBatchJob per
+ * `processhub.batch_size` entries (not one job per record); see LogBuffer
+ * for when partial batches are shipped.
  *
  * Почему queue, а не sync HTTP:
  *   - Ingest endpoint может быть временно недоступен — ретрай через Laravel
@@ -48,6 +52,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
         'info'      => 200,
         'notice'    => 250,
         'warning'   => 300,
+        'warn'      => 300, // ProcessHub's own name (INFO/WARN/ERROR)
         'error'     => 400,
         'critical'  => 500,
         'alert'     => 550,
@@ -55,7 +60,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
     ];
 
     public function __construct(
-        private readonly QueueFactory $queue,
+        private readonly LogBuffer $buffer,
         Level|int|string $level = Level::Warning,
         bool $bubble = true,
     ) {
@@ -64,6 +69,15 @@ class ProcessHubHandler extends AbstractProcessingHandler
 
     protected function write(LogRecord $record): void
     {
+        // Records produced while delivering logs (queue push, running
+        // SendLogBatchJob) or reporting its failures would feed back into
+        // this very channel — drop them.
+        if ($this->buffer->isMuted()
+            || SendLogBatchJob::isOwnFailure($record->context['exception'] ?? null)
+        ) {
+            return;
+        }
+
         $url = config('processhub.url');
         $token = config('processhub.token');
         if (! $url || ! $token) {
@@ -74,9 +88,10 @@ class ProcessHubHandler extends AbstractProcessingHandler
 
         // Master kill-switch from remote config — when ops flips
         // `enabled = false` in the ProcessHub UI, drop the record before
-        // queueing. Heartbeat refreshes config so the toggle propagates
-        // within ~60s. Server-side ingest also enforces this as a backup.
-        if (config('processhub.enabled', true) === false) {
+        // queueing ("false", 0, "off" too; unknown values keep it on).
+        // Heartbeat refreshes the config file; long-running workers pick it
+        // up after a restart. Server-side ingest also enforces this.
+        if (filter_var(config('processhub.enabled') ?? true, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) === false) {
             return;
         }
 
@@ -96,30 +111,44 @@ class ProcessHubHandler extends AbstractProcessingHandler
             }
         }
 
-        $entry = $this->buildEntry($record);
+        $this->buffer->push($this->buildEntry($record));
 
-        // Push to a dedicated queue so a log firehose doesn't starve the
-        // app's business jobs.
-        $queueName = config('processhub.queue');
-        $connection = config('processhub.connection');
-
-        $job = new SendLogBatchJob([$entry]);
-        if ($queueName) {
-            $job->onQueue($queueName);
+        if (($record->context['exception'] ?? null) instanceof FatalError) {
+            $this->buffer->flushFatalError();
         }
-        if ($connection) {
-            $job->onConnection($connection);
-        }
+    }
 
-        $this->queue->connection($connection)->pushOn($queueName, $job);
+    public function close(): void
+    {
+        $this->buffer->flush();
+        parent::close();
+    }
+
+    /**
+     * Called by Laravel/Octane between units of work on long-lived processes.
+     */
+    public function reset(): void
+    {
+        $this->buffer->flush();
+        parent::reset();
     }
 
     /**
      * Convert a Monolog record to the ProcessHub wire-format `ApplicationLog`.
+     *
+     * @return array<string, mixed>
      */
     protected function buildEntry(LogRecord $record): array
     {
-        $context = Redactor::redact($record->context ?? []);
+        // The Throwable is taken out BEFORE redaction: Redactor walks objects
+        // via get_object_vars(), which turns an exception into [] and loses
+        // the class/message/trace.
+        $rawContext = $record->context;
+        $exception = $rawContext['exception'] ?? null;
+        if ($exception instanceof \Throwable) {
+            unset($rawContext['exception']);
+        }
+        $context = Redactor::redact($rawContext);
 
         // contextType is a closed enum on the server (exception/query/job/mail/
         // http/scheduled). User code often puts domain-specific values in
@@ -133,11 +162,11 @@ class ProcessHubHandler extends AbstractProcessingHandler
         // If a Throwable was passed in context (Laravel Exception handler does
         // this) — extract a structured exception payload so ProcessHub can
         // render the stack trace and group by fingerprint.
-        if (($context['exception'] ?? null) instanceof \Throwable) {
-            /** @var \Throwable $e */
-            $e = $context['exception'];
+        if ($exception instanceof \Throwable) {
+            $e = $exception;
             $contextType = 'exception';
-            $context = [
+            // Message and trace may carry PII (emails, tokens) — mask them too.
+            $context = Redactor::redact([
                 'class' => get_class($e),
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -147,10 +176,10 @@ class ProcessHubHandler extends AbstractProcessingHandler
                     0,
                     30,
                 ),
-            ]
+            ])
                 // Preserve surviving keys from the original context so
                 // request-id and host aren't lost.
-                + array_diff_key($context, array_flip(['exception']));
+                + $context;
         }
 
         $requestId = null;

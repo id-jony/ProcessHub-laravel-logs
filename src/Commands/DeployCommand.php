@@ -109,7 +109,7 @@ class DeployCommand extends Command
         if ($exitCode !== 0 || empty($output)) {
             return null;
         }
-        $sha = trim($output[0] ?? '');
+        $sha = trim($output[0]);
         return $sha !== '' ? $sha : null;
     }
 
@@ -126,7 +126,6 @@ class DeployCommand extends Command
         if (empty($pairs)) return null;
         $out = [];
         foreach ($pairs as $pair) {
-            if (! is_string($pair)) continue;
             $eq = strpos($pair, '=');
             if ($eq === false || $eq === 0) {
                 $this->warn("Ignored metadata entry without '=': {$pair}");

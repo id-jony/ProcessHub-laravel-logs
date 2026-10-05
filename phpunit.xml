@@ -23,6 +23,7 @@
     <php>
         <env name="APP_ENV" value="testing"/>
         <env name="CACHE_DRIVER" value="array"/>
+        <server name="CACHE_STORE" value="array" force="true"/>
         <env name="QUEUE_CONNECTION" value="sync"/>
     </php>
 </phpunit>

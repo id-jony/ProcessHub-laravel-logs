@@ -14,6 +14,14 @@ jobs:
       matrix:
         php: ['8.1', '8.2', '8.3']
         laravel: ['10.*', '11.*', '12.*']
+        # Testbench major is tied to the Laravel major.
+        include:
+          - laravel: '10.*'
+            testbench: '^8.0'
+          - laravel: '11.*'
+            testbench: '^9.0'
+          - laravel: '12.*'
+            testbench: '^10.0'
         exclude:
           # Laravel 11 requires PHP 8.2+
           - php: '8.1'
@@ -23,6 +31,12 @@ jobs:
             laravel: '12.*'
 
     name: PHP ${{ matrix.php }} · Laravel ${{ matrix.laravel }}
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
 
     steps:
       - uses: actions/checkout@v4
@@ -43,11 +57,20 @@ jobs:
 
       - name: Install deps
         run: |
+          # Laravel 10 and 11 are past security support: every release has an
+          # open advisory and Composer >= 2.9 refuses to install it. The
+          # package still supports them, so allow it in CI only.
+          if [ "${{ matrix.laravel }}" != "12.*" ]; then
+            composer config audit.block-insecure false
+          fi
           composer require "laravel/framework:${{ matrix.laravel }}" --no-interaction --no-update
-          composer update --prefer-dist --no-interaction --no-progress
+          composer require "orchestra/testbench:${{ matrix.testbench }}" --dev --no-interaction --no-update
+          composer update --prefer-dist --no-interaction --no-progress -W
 
       - name: Run tests
         run: vendor/bin/phpunit --colors=always
+        env:
+          PROCESSHUB_TEST_REDIS_HOST: 127.0.0.1
 
   static-analysis:
     runs-on: ubuntu-latest
