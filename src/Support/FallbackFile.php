@@ -20,22 +20,26 @@ final class FallbackFile
      * errors, handler destructors) where the container may be half torn down.
      *
      * @param  array<int, array<string, mixed>>  $entries
+     * @return bool false — the file couldn't be written; true also when the
+     *              fallback is turned off (`fallback_path` = null)
      */
-    public static function append(array $entries, string $reason): void
+    public static function append(array $entries, string $reason): bool
     {
         if ($entries === []) {
-            return;
+            return true;
         }
 
         try {
             $path = config('processhub.fallback_path');
             if (! $path) {
-                return;
+                return true;
             }
             $line = self::line($entries, $reason);
-            self::locked($path, static fn () => self::write($path, $line));
+
+            return self::locked($path, static fn (): bool => self::write($path, $line));
         } catch (\Throwable) {
             // Nowhere left to report to.
+            return false;
         }
     }
 
@@ -80,11 +84,11 @@ final class FallbackFile
         }
     }
 
-    private static function write(string $path, string $line): void
+    private static function write(string $path, string $line): bool
     {
         $fh = @fopen($path, 'a+');
         if ($fh === false) {
-            return;
+            return false;
         }
 
         try {
@@ -95,8 +99,8 @@ final class FallbackFile
             if ($size > 0 && fseek($fh, -1, SEEK_END) === 0 && fread($fh, 1) !== "\n") {
                 $line = "\n" . $line;
             }
-            fwrite($fh, $line);
-            fflush($fh);
+
+            return fwrite($fh, $line) === strlen($line) && fflush($fh);
         } finally {
             flock($fh, LOCK_UN);
             fclose($fh);

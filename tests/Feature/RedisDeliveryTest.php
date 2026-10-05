@@ -6,11 +6,14 @@ use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Psr7\Request as GuzzleRequest;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Str;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
+use ProcessHub\Logs\Support\IngestThrottle;
 use ProcessHub\Logs\Tests\Concerns\UsesRedis;
 use ProcessHub\Logs\Tests\TestCase;
 
@@ -161,7 +164,7 @@ class RedisDeliveryTest extends TestCase
         $this->assertSame([0, 30, 60, 90], array_keys($scheduled));
         // Each batch gets the full retry window counted from its due time.
         foreach ($scheduled as $dueIn => $payload) {
-            $this->assertSame(now()->getTimestamp() + $dueIn + 3600, $payload['retryUntil']);
+            $this->assertSame(now()->getTimestamp() + $dueIn + 3600, unserialize($payload['data']['command'])->retryDeadline);
         }
         $this->assertSame(0, (int) Redis::connection()->exists('queues:logs-backlog:notify'));
     }
@@ -198,6 +201,110 @@ class RedisDeliveryTest extends TestCase
         $this->assertStringContainsString('outage', (string) file_get_contents(config('processhub.fallback_path')));
     }
 
+    /**
+     * Under a backlog a job may be picked up after its deadline. The worker
+     * used to fail it by `retryUntil` (MaxAttemptsExceeded → failed_jobs,
+     * Horizon «failed», a report) — tens of thousands in an overload.
+     */
+    public function test_job_picked_up_after_deadline_goes_to_fallback_not_to_failed_jobs(): void
+    {
+        Http::fake();
+        $failed = $this->countFailedJobs();
+
+        SendLogBatchJob::enqueue([['level' => 'ERROR', 'message' => 'late']]);
+        $this->travel(3601)->seconds();
+        $this->work();
+
+        $this->assertSame(0, $failed->count);
+        Http::assertNothingSent();
+        $this->assertSame(0, Queue::connection('redis')->size('logs'));
+        $lines = file(config('processhub.fallback_path'), FILE_IGNORE_NEW_LINES);
+        $this->assertCount(1, $lines);
+        $this->assertSame('late', json_decode($lines[0], true)['entries'][0]['message']);
+    }
+
+    /**
+     * A job queued by 0.3 (`maxTries` 3, no `retryUntil`) must not run out of
+     * attempts while the limiter keeps it waiting.
+     */
+    public function test_job_queued_by_v03_survives_local_rate_limit(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['accepted' => 1])]);
+        $failed = $this->countFailedJobs();
+        $command = preg_replace('/s:13:"retryDeadline";i:\d+;/', 's:5:"tries";i:3;', serialize(
+            (new SendLogBatchJob([['level' => 'WARNING', 'message' => 'legacy']]))->onConnection('redis')->onQueue('logs'),
+        ), 1, $replaced);
+        $this->assertSame(1, $replaced);
+        Queue::connection('redis')->pushRaw((string) json_encode([
+            'uuid' => (string) Str::uuid(), 'displayName' => SendLogBatchJob::class,
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call', 'maxTries' => 3, 'maxExceptions' => null,
+            'failOnTimeout' => false, 'backoff' => null, 'timeout' => 30, 'retryUntil' => null,
+            'data' => ['commandName' => SendLogBatchJob::class, 'command' => $command], 'attempts' => 0,
+        ]), 'logs');
+
+        for ($i = 0; $i < 5; $i++) {
+            IngestThrottle::make()->pauseFor(5);
+            $this->work();
+            $this->travel(6)->seconds();
+        }
+        $this->work();
+
+        $this->assertSame(0, $failed->count);
+        Http::assertSentCount(1);
+        $this->assertSame(0, Queue::connection('redis')->size('logs'));
+        $this->assertFileDoesNotExist(config('processhub.fallback_path'));
+    }
+
+    /**
+     * What the worker throws when it gives up on the job is recognised as the
+     * job's own failure (dontReportWhen/reportable hook), the batch is parked.
+     */
+    public function test_worker_giving_up_on_the_job_is_its_own_failure(): void
+    {
+        Http::fake();
+        $exceptions = [];
+        Event::listen(JobFailed::class, function (JobFailed $event) use (&$exceptions) {
+            $exceptions[] = $event->exception;
+        });
+
+        SendLogBatchJob::enqueue([['level' => 'ERROR', 'message' => 'abandoned']]);
+        $this->travel(3600 + 86_400 + 1)->seconds();
+        $this->work();
+
+        $this->assertCount(1, $exceptions);
+        $this->assertInstanceOf(MaxAttemptsExceededException::class, $exceptions[0]);
+        $this->assertTrue(SendLogBatchJob::isOwnFailure($exceptions[0]));
+        $this->assertStringContainsString('abandoned', (string) file_get_contents(config('processhub.fallback_path')));
+    }
+
+    public function test_batch_with_broken_utf8_is_queued_and_delivered(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['accepted' => 2])]);
+
+        SendLogBatchJob::enqueue([['level' => 'WARNING', 'message' => "bad \xB1 byte"], ['level' => 'WARNING', 'message' => 'ok']]);
+        $this->assertSame(1, Queue::connection('redis')->size('logs'));
+        $this->work();
+
+        Http::assertSent(fn ($request) => array_column($request['logs'], 'message') === ["bad \u{FFFD} byte", 'ok']);
+    }
+
+    public function test_batch_the_fallback_file_cannot_take_stays_in_failed_jobs(): void
+    {
+        config()->set('processhub.fallback_path', '/nonexistent-dir/processhub-fallback.log');
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+        $failed = [];
+        Event::listen(JobFailed::class, function (JobFailed $event) use (&$failed) {
+            $failed[] = $event->job->payload();
+        });
+
+        SendLogBatchJob::enqueue([['level' => 'ERROR', 'message' => 'precious']]);
+        $this->work();
+
+        $this->assertCount(1, $failed);
+        $this->assertSame('precious', unserialize($failed[0]['data']['command'])->entries[0]['message']);
+        $this->assertSame(0, Queue::connection('redis')->size('logs'));
+    }
+
     public function test_rebatch_queue_refuses_working_queue_as_source(): void
     {
         $this->artisan('processhub:rebatch-queue', ['--from' => 'logs'])->assertFailed();
@@ -221,6 +328,11 @@ class RedisDeliveryTest extends TestCase
         ksort($scheduled);
 
         return $scheduled;
+    }
+
+    private function work(): void
+    {
+        $this->artisan('queue:work', ['connection' => 'redis', '--queue' => 'logs', '--once' => true, '--tries' => 3]);
     }
 
     private function countFailedJobs(): \stdClass

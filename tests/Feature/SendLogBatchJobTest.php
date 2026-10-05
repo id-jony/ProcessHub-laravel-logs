@@ -14,6 +14,7 @@ use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Queue;
 use Mockery;
 use PHPUnit\Framework\Attributes\DataProvider;
 use ProcessHub\Logs\Exceptions\DeliveryFailedException;
@@ -160,7 +161,9 @@ class SendLogBatchJobTest extends TestCase
         $job = new SendLogBatchJob([]);
 
         $this->assertFalse(property_exists($job, 'tries'), 'attempt cap would let 429 exhaust the job');
-        $this->assertEqualsWithDelta(now()->addHour()->getTimestamp(), $job->retryUntil()->getTimestamp(), 5);
+        $this->assertEqualsWithDelta(now()->addHour()->getTimestamp(), $job->retryDeadline, 5);
+        // Срок проверяет сама задача; воркер не должен успеть пометить её упавшей.
+        $this->assertSame($job->retryDeadline + 86_400, $job->retryUntil()->getTimestamp());
         $this->assertSame([10, 30, 120, 300], $job->backoff());
         $this->assertTrue($job->failOnTimeout);
     }
@@ -241,7 +244,8 @@ class SendLogBatchJobTest extends TestCase
     public function test_rate_limit_pauses_all_senders(): void
     {
         config()->set('processhub.rate_limit_store', 'array');
-        $this->freezeTime();
+        // Ход после паузы — в целых секундах очереди, считая от начала текущей.
+        $this->freezeSecond();
         Http::fake(['ph.test/*' => Http::response('', 429, ['Retry-After' => '17'])]);
 
         $first = $this->jobWithQueueMock([['message' => 'a']], fn ($queueJob) => $queueJob->shouldReceive('release')->once()->with(17));
@@ -282,7 +286,45 @@ class SendLogBatchJobTest extends TestCase
             'past http-date' => ['@-30', 1],
             'garbage' => ['soon', LogIngest::DEFAULT_RETRY_AFTER],
             'missing' => ['', LogIngest::DEFAULT_RETRY_AFTER],
+            'negative' => ['-5', 1],
+            'optional whitespace' => [' 17 ', 17],
+            'signed' => ['+5', LogIngest::DEFAULT_RETRY_AFTER],
+            'fraction' => ['1.5', LogIngest::DEFAULT_RETRY_AFTER],
+            'with unit' => ['5s', LogIngest::DEFAULT_RETRY_AFTER],
         ];
+    }
+
+    /**
+     * Only IMF-fixdate is a date; whatever strtotime() would make of the
+     * rest (relative phrases, ISO 8601, other zones) is not a Retry-After.
+     *
+     * @return array<string, array{0: string, 1: int}>
+     */
+    public static function retryAfterDates(): array
+    {
+        $default = LogIngest::DEFAULT_RETRY_AFTER;
+
+        return [
+            'imf-fixdate' => ['Mon, 05 Oct 2026 12:02:00 GMT', 120],
+            'wrong weekday' => ['Fri, 05 Oct 2026 12:02:00 GMT', $default],
+            'day out of range' => ['Mon, 32 Oct 2026 12:02:00 GMT', $default],
+            'day not zero-padded' => ['Mon, 5 Oct 2026 12:02:00 GMT', $default],
+            'numeric zone' => ['Mon, 05 Oct 2026 12:02:00 +0000', $default],
+            'rfc 850' => ['Monday, 05-Oct-26 12:02:00 GMT', $default],
+            'asctime' => ['Mon Oct  5 12:02:00 2026', $default],
+            'iso 8601' => ['2026-10-05T12:02:00Z', $default],
+            'relative' => ['+2 minutes', $default],
+            'word' => ['tomorrow', $default],
+        ];
+    }
+
+    #[DataProvider('retryAfterDates')]
+    public function test_retry_after_accepts_only_imf_fixdate(string $header, int $expected): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-10-05 12:00:00', 'UTC'));
+        Http::fake(['ph.test/*' => Http::response('', 429, ['Retry-After' => $header])]);
+
+        $this->assertSame($expected, LogIngest::retryAfter(Http::get('https://ph.test/x')));
     }
 
     #[DataProvider('retryAfterHeaders')]
@@ -337,7 +379,7 @@ class SendLogBatchJobTest extends TestCase
         $job = new SendLogBatchJob([['message' => 'a']], 600);
 
         $this->assertSame(now()->getTimestamp() + 4200, $job->retryDeadline);
-        $this->assertSame(now()->getTimestamp() + 4200, $job->retryUntil()->getTimestamp());
+        $this->assertSame(now()->getTimestamp() + 4200 + 86_400, $job->retryUntil()->getTimestamp());
     }
 
     public function test_job_serialized_by_older_version_uses_payload_deadline(): void
@@ -355,13 +397,83 @@ class SendLogBatchJobTest extends TestCase
 
         $queueJob = Mockery::mock(Job::class);
         $queueJob->allows('attempts')->andReturn(1);
-        $queueJob->allows('retryUntil')->andReturn(now()->getTimestamp() + 5);
+        // 503 → backoff 10 s + 30 s timeout no longer fit before the payload deadline.
+        $queueJob->allows('retryUntil')->andReturn(now()->getTimestamp() + 35);
         $queueJob->shouldReceive('delete')->once();
         $job->setJob($queueJob);
 
         $job->handle();
 
         $this->assertFileExists(config('processhub.fallback_path'));
+    }
+
+    public function test_job_picked_up_after_its_deadline_parks_batch_without_posting(): void
+    {
+        Http::fake();
+        $job = $this->jobWithQueueMock([['message' => 'stale']], function ($queueJob) {
+            $queueJob->shouldReceive('delete')->once();
+            $queueJob->shouldNotReceive('release');
+            $queueJob->shouldNotReceive('fail');
+        });
+        $job->retryDeadline = now()->getTimestamp() - 1;
+
+        $job->handle();
+
+        Http::assertNothingSent();
+        $line = json_decode(trim((string) file_get_contents(config('processhub.fallback_path'))), true);
+        $this->assertSame('stale', $line['entries'][0]['message']);
+        $this->assertStringContainsString('waiting in the queue', $line['reason']);
+    }
+
+    public function test_unwritable_fallback_fails_job_instead_of_losing_batch(): void
+    {
+        config()->set('processhub.fallback_path', '/nonexistent-dir/processhub-fallback.log');
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+        $job = $this->jobWithQueueMock([['message' => 'precious']], function ($queueJob) {
+            // failed_jobs хранит пачку — её можно вернуть queue:retry.
+            $queueJob->shouldReceive('fail')->once()->with(Mockery::type(DeliveryFailedException::class));
+            $queueJob->shouldNotReceive('delete');
+        });
+
+        $job->handle();
+    }
+
+    public function test_unwritable_fallback_without_queue_throws(): void
+    {
+        config()->set('processhub.fallback_path', '/nonexistent-dir/processhub-fallback.log');
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+
+        $this->expectException(DeliveryFailedException::class);
+        (new SendLogBatchJob([['message' => 'precious']]))->handle();
+    }
+
+    public function test_broken_utf8_does_not_make_batch_unqueueable(): void
+    {
+        $job = new SendLogBatchJob([['message' => "bad \xB1 byte", 'context' => ["k\xB1" => 'v']], ['message' => 'ok']]);
+
+        // Payload очереди — JSON с сериализованной задачей внутри.
+        $this->assertNotFalse(json_encode(['command' => serialize($job)]));
+        $this->assertSame("bad \u{FFFD} byte", $job->entries[0]['message']);
+        $this->assertSame(['ok'], array_column(array_slice($job->entries, 1), 'message'));
+    }
+
+    public function test_job_queued_by_v03_is_retried_as_a_new_job(): void
+    {
+        Queue::fake();
+        Http::fake(['ph.test/*' => Http::response('', 503)]);
+        $job = $this->legacyJob();
+        $queueJob = Mockery::mock(Job::class);
+        // Payload 0.3: maxTries 3, retryUntil нет — release() на 3-й попытке дал бы MaxAttemptsExceeded.
+        $queueJob->allows('attempts')->andReturn(3);
+        $queueJob->allows('retryUntil')->andReturn(null);
+        $queueJob->shouldReceive('delete')->once();
+        $queueJob->shouldNotReceive('release');
+        $job->setJob($queueJob);
+
+        $job->handle();
+
+        Queue::assertPushed(SendLogBatchJob::class, fn (SendLogBatchJob $retry) => $retry->entries === [['message' => 'old']]
+            && $retry->retryDeadline === now()->getTimestamp() + 120 + 3600);
     }
 
     /**
@@ -398,6 +510,20 @@ class SendLogBatchJobTest extends TestCase
         $this->assertFalse(SendLogBatchJob::isOwnFailure(TimeoutExceededException::forJob($other)));
     }
 
+    /** Shape of a job queued by 0.3: `$tries = 3`, no `retryDeadline`. */
+    private function legacyJob(): SendLogBatchJob
+    {
+        $class = SendLogBatchJob::class;
+        $job = @unserialize(sprintf(
+            'O:%d:"%s":2:{s:7:"entries";a:1:{i:0;a:1:{s:7:"message";s:3:"old";}}s:5:"tries";i:3;}',
+            strlen($class),
+            $class,
+        ));
+        $this->assertInstanceOf(SendLogBatchJob::class, $job);
+
+        return $job;
+    }
+
     /**
      * @param  array<int, array<string, mixed>>  $entries
      */
@@ -405,6 +531,8 @@ class SendLogBatchJobTest extends TestCase
     {
         $queueJob = Mockery::mock(Job::class);
         $expectations($queueJob);
+        // Первая попытка, если тест не задал иначе (первое объявление выигрывает).
+        $queueJob->allows('attempts')->andReturn(1);
         $job = new SendLogBatchJob($entries);
         $job->setJob($queueJob);
 

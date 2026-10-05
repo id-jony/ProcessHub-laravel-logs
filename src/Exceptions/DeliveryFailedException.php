@@ -26,4 +26,10 @@ final class DeliveryFailedException extends RuntimeException
     {
         return new self('ProcessHub ingest unreachable: ' . $previous->getMessage(), 0, $previous);
     }
+
+    /** The batch had to be parked, but the fallback file couldn't take it. */
+    public static function unparked(string $reason): self
+    {
+        return new self('ProcessHub log batch could not be written to the fallback file: ' . $reason);
+    }
 }

@@ -13,7 +13,8 @@ use ProcessHub\Logs\Jobs\SendLogBatchJob;
  * 47 times last hour").
  *
  * Failures of SendLogBatchJob itself are skipped: their batches already go
- * to the fallback file via `failed()`, and logging them into the same
+ * to the fallback file via `failed()` (or stay in failed_jobs when the file
+ * can't be written), and logging them into the same
  * channel would enqueue a new SendLogBatchJob per failure — a feedback loop.
  */
 class HandleJobFailed

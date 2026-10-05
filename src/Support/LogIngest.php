@@ -62,8 +62,10 @@ final class LogIngest
     }
 
     /**
-     * Seconds to wait according to `Retry-After` (delta-seconds or HTTP-date),
-     * clamped to [MIN_RETRY_AFTER, MAX_RETRY_AFTER].
+     * Seconds to wait according to `Retry-After`, clamped to
+     * [MIN_RETRY_AFTER, MAX_RETRY_AFTER]. Accepted: whole seconds (a negative
+     * value means "now") or an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`,
+     * RFC 7231 §7.1.1.1); anything else → DEFAULT_RETRY_AFTER.
      */
     public static function retryAfter(Response $response): int
     {
@@ -71,12 +73,21 @@ final class LogIngest
 
         if (preg_match('/^-?\d+$/', $header)) {
             $seconds = (int) $header;
-        } elseif ($header !== '' && ($at = strtotime($header)) !== false) {
-            $seconds = $at - now()->getTimestamp();
+        } elseif (($at = self::httpDate($header)) !== null) {
+            $seconds = $at->getTimestamp() - now()->getTimestamp();
         } else {
             $seconds = self::DEFAULT_RETRY_AFTER;
         }
 
         return max(self::MIN_RETRY_AFTER, min(self::MAX_RETRY_AFTER, $seconds));
+    }
+
+    private static function httpDate(string $value): ?\DateTimeImmutable
+    {
+        $date = \DateTimeImmutable::createFromFormat(DATE_RFC7231, $value, new \DateTimeZone('UTC'));
+
+        // createFromFormat переносит переполнение (32 Oct → 1 Nov) и подгоняет
+        // дату под день недели — строгий разбор: обратно та же строка.
+        return $date !== false && $date->format(DATE_RFC7231) === $value ? $date : null;
     }
 }
