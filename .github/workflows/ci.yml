@@ -57,10 +57,10 @@ jobs:
 
       - name: Install deps
         run: |
-          # Laravel 10 is EOL: every 10.x release has a security advisory and
-          # Composer >= 2.9 refuses to install it. Still supported by the
-          # package, so allow it in CI only.
-          if [ "${{ matrix.laravel }}" = "10.*" ]; then
+          # Laravel 10 and 11 are past security support: every release has an
+          # open advisory and Composer >= 2.9 refuses to install it. The
+          # package still supports them, so allow it in CI only.
+          if [ "${{ matrix.laravel }}" != "12.*" ]; then
             composer config audit.block-insecure false
           fi
           composer require "laravel/framework:${{ matrix.laravel }}" --no-interaction --no-update
