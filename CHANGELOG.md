@@ -21,77 +21,119 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   shipped by age (`flush_interval_sec`, 10 s; checked on push, `JobProcessed`,
   `JobFailed`, `Looping`), not after every job. Full flush on app
   `terminating`, `CommandFinished`, `WorkerStopping`, Octane
-  `RequestTerminated`, handler `close()`/`reset()` and in a shutdown function
-  — fatal errors (OOM, `max_execution_time`) deliver both the buffer and the
-  `FatalError`. `SIGKILL` still loses the unsent buffer. A child after
-  `pcntl_fork()` drops the inherited buffer instead of resending it.
+  `RequestTerminated`, handler `close()`/`reset()` and in a shutdown function.
+  `SIGKILL` still loses the unsent buffer. A child after `pcntl_fork()` drops
+  the inherited buffer instead of resending it.
+- **Daemons without a worker loop** (`horizon`, `horizon:supervisor`,
+  `schedule:work`, `queue:listen`, `reverb:start`, `pulse:check`,
+  `pulse:work`, `octane:start` and the commands in
+  `processhub.unbuffered_commands`) queue every entry right away instead of
+  holding it until the next record.
+- **Fatal errors** (OOM, `max_execution_time`) deliver both the buffer and the
+  `FatalError`. The package keeps its own 256 KB memory reserve and preloads
+  the classes Laravel needs to build the `FatalError`; its reportable
+  callback frees the reserve, raises `memory_limit` by 16 MB like Sentry
+  (only above current usage, `@ini_set`) and ships the buffer before
+  Sentry/daily/rendering run. `HandleExceptions::$reservedMemory` is not
+  touched. A `FatalError` Laravel didn't log (dontReport, throttling, failing
+  logger) is shipped from `error_get_last()` — once.
 - **No feedback loops** — the buffer is muted while a worker processes a
-  `SendLogBatchJob` (until the next job / loop tick / worker stop), so the
-  worker reporting its exception can't create a new batch; `HandleJobFailed`
+  `SendLogBatchJob`, until the attempt is over (`JobAttempted`, Laravel 11+;
+  on Laravel 10 until the next job / loop tick / worker stop); the exception
+  the worker then reports is recognised and dropped. `HandleJobFailed`
   ignores failures of `SendLogBatchJob`; the handler drops reports of its own
   delivery failures. A throwing queue push no longer reaches the app — the
-  batch goes to the fallback file.
-- **One entry per exception** — the same exception object is shipped once,
-  even with `processhub` in the default `stack`.
-- **No Sentry/daily spam** — `DeliveryFailedException` is excluded from
-  exception reporting (`dontReportWhen()` on Laravel 12, which also covers
-  `MaxAttemptsExceeded`/`TimeoutExceeded` of `SendLogBatchJob`; `ignore()` on
-  Laravel 11 and older).
+  batch goes to the fallback file, once (on the `sync` connection the failed
+  inline delivery has already parked it). `queue:work --once` in tests no
+  longer leaves the channel muted.
+- **No Sentry/daily spam on Laravel 10–12** — the package's reportable
+  callback is registered while the exception handler is being resolved
+  (before `withExceptions()` callbacks such as Sentry's
+  `Integration::handles()`) and returns `false` for
+  `SendLogBatchJob::isOwnFailure()` (`DeliveryFailedException`,
+  `MaxAttemptsExceeded`/`TimeoutExceeded` of the job). `dontReportWhen()`
+  (Laravel 12) / `ignore(DeliveryFailedException)` (Laravel 11 and older)
+  stay. A classic `app/Exceptions/Handler.php` needs the same `reportable()`
+  line before Sentry's (see README).
+- **Exception context kept** — with `processhub` in the default channel or
+  stack, Laravel's own report log (with the exception's `context()` and
+  `userId`) is the shipped entry; the auto-capture hook logs only when the
+  default channel doesn't reach processhub, and adds `context()` itself.
+  The same exception logged twice is shipped twice.
 - **429 no longer burns attempts** — `SendLogBatchJob` retries by time only:
-  `retryUntil()` = `retry_window_sec` (1h) from the moment the batch is due,
-  no `$tries`/`$maxExceptions`. `Retry-After` (seconds or HTTP-date, clamped
-  to 1–600 s, 30 s when missing) on 429, `backoff()` 10/30/120/300 s on
-  5xx / network, `$failOnTimeout = true`.
+  a deadline of `retry_window_sec` (1h) from the moment the batch is due,
+  checked by the job itself (a job picked up late is parked, not failed);
+  the worker's `retryUntil()` is the deadline + 24 h, no
+  `$tries`/`$maxExceptions`. Jobs queued by 0.3 (`$tries = 3`) are retried as
+  new jobs. `Retry-After` (whole seconds or IMF-fixdate, clamped to 1–600 s,
+  30 s otherwise) on 429, `backoff()` 10/30/120/300 s on 5xx / network,
+  `$failOnTimeout = true`.
 - **Every transport error is a delivery failure** — connect, reset, TLS,
   HTTP/2 (e.g. cURL 55/56/60/92 that Laravel < 12 passed through unwrapped)
   → `DeliveryFailedException` and a regular retry.
 - **Bad values don't sink a batch** — `INF`/`NaN` and broken UTF-8 are
-  substituted when encoding.
+  substituted when encoding; broken UTF-8 no longer makes a batch
+  unqueueable.
 - **Dead ends go to the fallback file, not `failed_jobs`** — 4xx (except
-  429) or a retry that wouldn't fit before the deadline appends the batch to
-  the fallback file and deletes the job. `failed()` stays for timeouts and
-  jobs picked up after their deadline.
+  429), a job picked up after its deadline or a retry that wouldn't fit
+  before it appends the batch to the fallback file and deletes the job.
+  `failed()` stays for timeouts; a batch the fallback file can't take stays
+  in `failed_jobs`.
 - **Exceptions in context reach ProcessHub again** — `ProcessHubHandler`
   extracts the `Throwable` before `Redactor` runs (it used to turn the
   exception object into `[]`, so class/message/stack trace were lost).
   Message and trace are still masked by `Redactor`.
+- **Test suites** — entries of a flushed application are dropped instead of
+  being pushed into the next one or into the fallback file.
 - **`processhub:flush-fallback`** streams the file instead of loading it and
   packs entries from many lines into full batches. The live file is taken
   over as a snapshot `<path>.flushing` under the lock `<path>.write.lock`
   shared with appends; the snapshot is never rewritten, progress goes to
   `<path>.flushing.offset` (after `kill -9` at most one batch is resent).
-  Requests are paced by `--rate` and the shared limiter, 429 is waited out up
-  to `--max-wait`, every pause is ≥ 1 s. A batch refused with 4xx (except
-  401/403/404/405/408/429) is split in halves; single refused entries go to
-  `<path>.rejected` with the reason (`cat <path>.rejected >> <path>` to
-  retry). 401/403/404/405 or 5 temporary failures in a row (backoff
-  2–16 s) stop the run with exit code 1, nothing skipped. A
-  `<path>.flushing.tmp` left by an earlier build is no longer used — delete
-  it by hand.
+  Requests are paced by `--rate` and the shared limiter (lining up behind
+  jobs waiting for their turn), 429 is waited out up to `--max-wait`, every
+  pause is ≥ 1 s. On 4xx (except 401/403/404/405/408/429) entries named in a
+  validation response (`errors.logs.<i>…`) go to `<path>.rejected` with their
+  messages without splitting the batch; otherwise the batch is split in
+  halves until the refused entries are isolated (`cat <path>.rejected >>
+  <path>` to retry). Unparseable lines go to `.rejected` as `raw`.
+  401/403/404/405 or 5 temporary failures in a row (backoff 2–16 s) stop the
+  run with exit code 1, nothing skipped. A `<path>.flushing.tmp` left by an
+  earlier build is picked up automatically.
 
 ### Added
 
 - `IngestThrottle` — rate limit for ingest POSTs shared by all workers and
-  `processhub:flush-fallback` through a cache store; a 429 pauses every
-  sender.
+  `processhub:flush-fallback` (GCRA, burst ⌈limit/10⌉: ≤ limit + burst in
+  any 60 s) in one cache key under `Cache::lock`; refused senders get
+  successive turns (FIFO, ~2 attempts per queued job); a 429 pauses every
+  sender. A store without atomic locks makes it step aside with a warning.
 - `processhub:rebatch-queue --from=<queue> [--chunk] [--limit] [--rate]
-  [--start-delay]` — repacks a Redis backlog of single-entry jobs into full
-  batches (atomic chunk claim, crash recovery). Batches are spread at
-  `--rate` per minute (default `rate_limit_per_minute`, `0` = all at once)
-  after what already sits in the target queue, each with a full retry window
-  from its due time; `queues:<from>:notify` is deleted once the backlog is
-  drained. Prepare the backlog with `RENAMENX` of `queues:logs` and
-  `queues:logs:notify`.
+  [--start-delay] [--max-ahead]` — repacks a Redis backlog of single-entry
+  jobs into full batches (atomic chunk claim, progress acknowledged after
+  every batch — a crash re-sends at most one batch; lock against concurrent
+  runs; `:notify` kept in step). Batches are spread at `--rate` per minute
+  (default `rate_limit_per_minute`, `0` = all at once) after what already
+  sits in the target queue, each with a full retry window from its due time;
+  `--max-ahead` schedules a rolling window. Prepare the backlog with
+  `RENAMENX` of `queues:logs` and `queues:logs:notify` (see README,
+  "Recovering from a pre-0.4 backlog").
+- `processhub:forget-failed [--dry-run] [--to-fallback]` — deletes failed
+  records of `SendLogBatchJob` only (`failed_jobs`, Horizon).
 - `processhub:flush-fallback` options `--limit`, `--max-wait`, `--rate`
   (default `rate_limit_per_minute`), `--max-runtime` (300).
 - `SendLogBatchJob::enqueue($entries, $delaySeconds = 0)`; the delay shifts
   the retry deadline.
+- `FallbackFile::store()` — writes a line and reports whether it was written
+  (`false` without `fallback_path`); `append()` now returns `bool` too
+  (`true` when the fallback is turned off).
 - Config: `batch_max_bytes` (`PROCESSHUB_LOG_BATCH_MAX_BYTES`, 1800000),
   `flush_interval_sec` (`PROCESSHUB_LOG_FLUSH_INTERVAL_SEC`, 10),
   `retry_window_sec` (`PROCESSHUB_LOG_RETRY_WINDOW_SEC`, 3600),
   `rate_limit_per_minute` (`PROCESSHUB_RATE_LIMIT_PER_MINUTE`, 50, `0` = off),
   `rate_limit_store` (`PROCESSHUB_RATE_LIMIT_STORE`, default cache store;
-  must be shared — redis / database).
+  must be shared and support atomic locks — redis / memcached / database),
+  `unbuffered_commands` (`[]`).
 
 ### Changed
 
@@ -102,7 +144,8 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 - `Queue job failed` entries are now shipped with their exception:
   `contextType=exception` and `context.class` is the exception class, not the
   job class (the job class is no longer in the entry; `connection`, `queue`,
-  `attempts` are kept).
+  `attempts` are kept). A job that fails for good produces two entries:
+  `Queue job failed` and the worker's report of the exception.
 
 ## [0.3.0] — 2026-08-29
 
