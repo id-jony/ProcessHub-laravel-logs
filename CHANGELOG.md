@@ -30,6 +30,10 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   (`retry_window_sec`, 1h) instead of `$tries = 3`, `release(Retry-After)` on
   429, `backoff()` 10/30/120/300 s on 5xx/network, `$maxExceptions = 10`,
   `$failOnTimeout = true`. 4xx still fails immediately into the fallback file.
+- **Exceptions in context reach ProcessHub again** — `ProcessHubHandler`
+  extracts the `Throwable` before `Redactor` runs (it used to turn the
+  exception object into `[]`, so class/message/stack trace were lost).
+  Message and trace are still masked by `Redactor`.
 - **`processhub:flush-fallback`** streams the file instead of loading it,
   packs entries from many lines into full batches, waits out 429, keeps the
   unsent remainder (temp file + rename) and never sends a line twice unless

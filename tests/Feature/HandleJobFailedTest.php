@@ -29,7 +29,8 @@ class HandleJobFailedTest extends TestCase
         Queue::assertPushed(SendLogBatchJob::class, function (SendLogBatchJob $job) {
             return count($job->entries) === 1
                 && $job->entries[0]['message'] === 'Queue job failed'
-                && $job->entries[0]['context']['class'] === 'App\\Jobs\\SendReceipt';
+                && $job->entries[0]['context']['connection'] === 'redis'
+                && $job->entries[0]['context']['message'] === 'boom';
         });
     }
 

@@ -131,7 +131,15 @@ class ProcessHubHandler extends AbstractProcessingHandler
      */
     protected function buildEntry(LogRecord $record): array
     {
-        $context = Redactor::redact($record->context ?? []);
+        // The Throwable is taken out BEFORE redaction: Redactor walks objects
+        // via get_object_vars(), which turns an exception into [] and loses
+        // the class/message/trace.
+        $rawContext = $record->context;
+        $exception = $rawContext['exception'] ?? null;
+        if ($exception instanceof \Throwable) {
+            unset($rawContext['exception']);
+        }
+        $context = Redactor::redact($rawContext);
 
         // contextType is a closed enum on the server (exception/query/job/mail/
         // http/scheduled). User code often puts domain-specific values in
@@ -145,11 +153,11 @@ class ProcessHubHandler extends AbstractProcessingHandler
         // If a Throwable was passed in context (Laravel Exception handler does
         // this) — extract a structured exception payload so ProcessHub can
         // render the stack trace and group by fingerprint.
-        if (($context['exception'] ?? null) instanceof \Throwable) {
-            /** @var \Throwable $e */
-            $e = $context['exception'];
+        if ($exception instanceof \Throwable) {
+            $e = $exception;
             $contextType = 'exception';
-            $context = [
+            // Message and trace may carry PII (emails, tokens) — mask them too.
+            $context = Redactor::redact([
                 'class' => get_class($e),
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
@@ -159,10 +167,10 @@ class ProcessHubHandler extends AbstractProcessingHandler
                     0,
                     30,
                 ),
-            ]
+            ])
                 // Preserve surviving keys from the original context so
                 // request-id and host aren't lost.
-                + array_diff_key($context, array_flip(['exception']));
+                + $context;
         }
 
         $requestId = null;
