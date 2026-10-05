@@ -128,6 +128,8 @@ class ProcessHubHandler extends AbstractProcessingHandler
 
     /**
      * Convert a Monolog record to the ProcessHub wire-format `ApplicationLog`.
+     *
+     * @return array<string, mixed>
      */
     protected function buildEntry(LogRecord $record): array
     {

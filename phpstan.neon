@@ -10,6 +10,7 @@ parameters:
 
     # Reportable callback accepts `?bool` in some Laravel versions, `void` in
     # others — ignore to let the package run on the full matrix.
+    reportUnmatchedIgnoredErrors: false
     ignoreErrors:
         - '#Anonymous function should return void but return statement is missing#'
         - '#Method .+ has parameter .+ with no value type specified in iterable type array#'

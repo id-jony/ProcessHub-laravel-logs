@@ -95,7 +95,11 @@ class RemoteConfigClient
         return $this->cachedVersion;
     }
 
-    /** Returns the full effective config (merged remote > defaults). */
+    /**
+     * Returns the full effective config (merged remote > defaults).
+     *
+     * @return array<string, mixed>
+     */
     public function effective(): array
     {
         return $this->effective ?? [];
@@ -237,7 +241,11 @@ class RemoteConfigClient
         );
     }
 
-    /** For `processhub:config:show` diagnostics — emits the RAW cache. */
+    /**
+     * For `processhub:config:show` diagnostics — emits the RAW cache.
+     *
+     * @return array<string, mixed>|null
+     */
     public function dumpCache(): ?array
     {
         $path = $this->cachePath();

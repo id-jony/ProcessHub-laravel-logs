@@ -24,7 +24,7 @@ class HandleJobFailed
             return;
         }
 
-        $payload = $event->job->payload() ?? [];
+        $payload = $event->job->payload();
         Log::channel('processhub')->error('Queue job failed', [
             'type' => 'job',
             'class' => $payload['displayName'] ?? 'unknown',

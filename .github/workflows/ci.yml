@@ -14,6 +14,14 @@ jobs:
       matrix:
         php: ['8.1', '8.2', '8.3']
         laravel: ['10.*', '11.*', '12.*']
+        # Testbench major is tied to the Laravel major.
+        include:
+          - laravel: '10.*'
+            testbench: '^8.0'
+          - laravel: '11.*'
+            testbench: '^9.0'
+          - laravel: '12.*'
+            testbench: '^10.0'
         exclude:
           # Laravel 11 requires PHP 8.2+
           - php: '8.1'
@@ -49,8 +57,15 @@ jobs:
 
       - name: Install deps
         run: |
+          # Laravel 10 is EOL: every 10.x release has a security advisory and
+          # Composer >= 2.9 refuses to install it. Still supported by the
+          # package, so allow it in CI only.
+          if [ "${{ matrix.laravel }}" = "10.*" ]; then
+            composer config audit.block-insecure false
+          fi
           composer require "laravel/framework:${{ matrix.laravel }}" --no-interaction --no-update
-          composer update --prefer-dist --no-interaction --no-progress
+          composer require "orchestra/testbench:${{ matrix.testbench }}" --dev --no-interaction --no-update
+          composer update --prefer-dist --no-interaction --no-progress -W
 
       - name: Run tests
         run: vendor/bin/phpunit --colors=always

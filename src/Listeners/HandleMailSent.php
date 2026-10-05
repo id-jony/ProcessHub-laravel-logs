@@ -35,7 +35,7 @@ class HandleMailSent
             'messageId' => method_exists($message, 'getMessageId')
                 ? $message->getMessageId()
                 : null,
-            'data' => $event->data ?? [],
+            'data' => $event->data,
         ]);
     }
 }
