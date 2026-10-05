@@ -27,14 +27,21 @@ use ProcessHub\Logs\Support\LogIngest;
  *      (atomic tmp + rename); the next run resumes there. A crash between a
  *      POST and the checkpoint resends one batch: at-least-once, no loss.
  *   3. A fully processed snapshot is deleted and the next one is claimed.
+ *   4. `<path>.flushing.tmp` left by an earlier 0.4 build (it rewrote the
+ *      remainder there before renaming it over the snapshot) is removed when
+ *      the snapshot exists — the snapshot holds everything it had — and
+ *      adopted as the snapshot otherwise.
  *
  * Delivery:
  *   - requests are paced to --rate per minute;
  *   - 429 waits Retry-After (at least 1 s, up to --max-wait);
  *   - 5xx / network errors back off exponentially; after
  *     MAX_CONSECUTIVE_FAILURES in a row the run stops with FAILURE;
- *   - other 4xx rejects the batch: it is split in halves until the offending
- *     entries are isolated, those go to `<path>.rejected` with the reason;
+ *   - other 4xx rejects the batch: entries named in a validation response
+ *     (`errors` keys `logs.<i>…`) go to `<path>.rejected` with their
+ *     messages and the rest is resent; otherwise the batch is split in
+ *     halves until the offending entries are isolated;
+ *   - lines that can't be parsed go to `<path>.rejected` as `raw`;
  *   - 401/403/404/405 mean misconfiguration — stop with FAILURE, nothing is
  *     skipped.
  *
@@ -154,7 +161,9 @@ class FlushFallbackCommand extends Command
     {
         clearstatcache();
 
-        return (is_file($path) && filesize($path) > 0) || is_file($path . '.flushing');
+        return (is_file($path) && filesize($path) > 0)
+            || is_file($path . '.flushing')
+            || is_file($path . '.flushing.tmp');
     }
 
     /**
@@ -166,6 +175,7 @@ class FlushFallbackCommand extends Command
         $path = $this->path;
         $snapshot = $path . '.flushing';
         clearstatcache();
+        $this->adoptLegacyRemainder($snapshot);
 
         if (is_file($snapshot)) {
             return $snapshot;
@@ -182,6 +192,28 @@ class FlushFallbackCommand extends Command
 
             return @rename($path, $snapshot) ? $snapshot : null;
         });
+    }
+
+    /**
+     * Earlier 0.4 builds wrote the unsent remainder of the snapshot to
+     * `<snapshot>.tmp` and renamed it over the snapshot. A crash before the
+     * rename leaves both — the snapshot is a superset, the copy is dropped;
+     * a copy without a snapshot is the only one left and becomes it.
+     */
+    private function adoptLegacyRemainder(string $snapshot): void
+    {
+        $legacy = $snapshot . '.tmp';
+        if (! is_file($legacy)) {
+            return;
+        }
+
+        if (is_file($snapshot)) {
+            @unlink($legacy);
+            $this->line("Removed {$legacy} left by an earlier version (the snapshot holds all of it).");
+        } elseif (@rename($legacy, $snapshot)) {
+            $this->line("Resuming from {$legacy} left by an earlier version.");
+        }
+        clearstatcache();
     }
 
     /**
@@ -221,6 +253,9 @@ class FlushFallbackCommand extends Command
             $entries = $this->decodeLine($line);
             if ($entries === null) {
                 if (str_ends_with($line, "\n")) {
+                    if (! $this->reject([], 'malformed line', rtrim($line, "\r\n"))) {
+                        return false;
+                    }
                     $this->malformed++;
                 } else {
                     // Хвост без "\n" — оборванная запись (писатель упал посреди fwrite):
@@ -300,7 +335,20 @@ class FlushFallbackCommand extends Command
             return true;
         }
 
-        if (count($batch) > 1) {
+        $invalid = $this->invalidEntries($response, count($batch));
+        if ($invalid !== [] && count($invalid) < count($batch)) {
+            foreach ($invalid as $i => $messages) {
+                $reason = sprintf('HTTP %d: %s', $response->status(), mb_substr(implode('; ', $messages), 0, 500));
+                if (! $this->reject([$batch[$i]], $reason)) {
+                    return false;
+                }
+            }
+            $this->warn(sprintf('ProcessHub rejected %d entries — moved to %s.', count($invalid), $this->rejectedPath()));
+
+            return $this->resolve(array_values(array_diff_key($batch, $invalid)));
+        }
+
+        if ($invalid === [] && count($batch) > 1) {
             $half = intdiv(count($batch) + 1, 2);
 
             return $this->resolve(array_slice($batch, 0, $half))
@@ -308,7 +356,7 @@ class FlushFallbackCommand extends Command
         }
 
         $reason = sprintf('HTTP %d: %s', $response->status(), mb_substr($response->body(), 0, 500));
-        $this->warn("ProcessHub rejected an entry ({$reason}) — moved to {$this->rejectedPath()}.");
+        $this->warn(sprintf('ProcessHub rejected %d entries (%s) — moved to %s.', count($batch), $reason, $this->rejectedPath()));
 
         return $this->reject($batch, $reason);
     }
@@ -358,6 +406,32 @@ class FlushFallbackCommand extends Command
         }
 
         return null;
+    }
+
+    /**
+     * Entries a validation response (`{"errors": {"logs.3.level": ["…"]}}`)
+     * points at, with their messages — no need to bisect the batch.
+     *
+     * @return array<int, array<int, string>> index in the batch => messages
+     */
+    private function invalidEntries(Response $response, int $count): array
+    {
+        $errors = $response->json('errors');
+        if (! is_array($errors)) {
+            return [];
+        }
+
+        $invalid = [];
+        foreach ($errors as $key => $messages) {
+            if (preg_match('/^logs\.(\d+)(?:\.|$)/', (string) $key, $m) && (int) $m[1] < $count) {
+                foreach ((array) $messages as $message) {
+                    $invalid[(int) $m[1]][] = $key . ': ' . (is_scalar($message) ? $message : json_encode($message));
+                }
+            }
+        }
+        ksort($invalid);
+
+        return $invalid;
     }
 
     private function isRejection(int $status): bool
@@ -417,7 +491,10 @@ class FlushFallbackCommand extends Command
         }
 
         // Общий лимит токена: те же слоты делят воркеры SendLogBatchJob.
-        while (($wait = $this->throttle->acquire()) > 0) {
+        // Первый запрос встаёт в очередь за ждущими задачами, дальше ждём свой ход.
+        $newcomer = true;
+        while (($wait = $this->throttle->acquire(newcomer: $newcomer)) > 0) {
+            $newcomer = false;
             if (! $this->sleepUntil($this->nowMs() + $wait * 1000)) {
                 return false;
             }
@@ -534,7 +611,7 @@ class FlushFallbackCommand extends Command
             $this->warn("Rejected {$this->rejected} entries — see {$this->rejectedPath()}.");
         }
         if ($this->malformed > 0) {
-            $this->warn("Skipped {$this->malformed} malformed lines.");
+            $this->warn("Moved {$this->malformed} malformed lines to {$this->rejectedPath()}.");
         }
     }
 

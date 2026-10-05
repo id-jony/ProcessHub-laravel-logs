@@ -331,17 +331,97 @@ class FlushFallbackCommandTest extends TestCase
         $this->assertSame($torn, $rejected['raw']);
     }
 
-    public function test_malformed_lines_are_skipped(): void
+    public function test_malformed_lines_are_moved_aside_not_lost(): void
     {
         Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
         $this->writeFallback(lines: 1, perLine: 3);
         file_put_contents($this->path(), "not json\n", FILE_APPEND);
 
         $this->artisan('processhub:flush-fallback')
-            ->expectsOutputToContain('Skipped 1 malformed lines.')
+            ->expectsOutputToContain('Moved 1 malformed lines to')
             ->assertSuccessful();
 
         $this->assertSame($this->expectedMessages(3), $this->sentMessages());
+        $rejected = json_decode(file_get_contents($this->path() . '.rejected'), true);
+        $this->assertSame('not json', $rejected['raw']);
+        $this->assertSame([], $rejected['entries']);
+    }
+
+    public function test_validation_errors_isolate_entries_without_bisecting(): void
+    {
+        Http::fake(function (Request $request) {
+            $messages = array_column($request->data()['logs'], 'message');
+            $errors = [];
+            foreach (['m-3', 'm-71'] as $bad) {
+                if (($i = array_search($bad, $messages, true)) !== false) {
+                    $errors["logs.{$i}.level"] = ["The logs.{$i}.level field is invalid."];
+                }
+            }
+
+            return $errors === []
+                ? Http::response(['ok' => true])
+                : Http::response(['message' => 'invalid', 'errors' => $errors], 422);
+        });
+        $this->writeFallback(lines: 1, perLine: 100);
+
+        $this->artisan('processhub:flush-fallback', ['--rate' => 6000])->assertSuccessful();
+
+        // Один отказ + один повтор остатка, без деления пополам.
+        $this->assertSame([100, 98], $this->sentSizes());
+        $this->assertSame(array_values(array_diff($this->expectedMessages(100), ['m-3', 'm-71'])), $this->deliveredMessages());
+        $rejected = array_map(fn ($line) => json_decode($line, true), file($this->path() . '.rejected', FILE_IGNORE_NEW_LINES));
+        $this->assertSame(['m-3', 'm-71'], array_map(fn ($line) => $line['entries'][0]['message'], $rejected));
+        $this->assertStringContainsString('logs.71.level: The logs.71.level field is invalid.', $rejected[1]['reason']);
+    }
+
+    public function test_batch_refused_entirely_by_validation_costs_one_request(): void
+    {
+        Http::fake(function (Request $request) {
+            $errors = [];
+            foreach (array_keys($request->data()['logs']) as $i) {
+                $errors["logs.{$i}.timestamp"] = ['Too old.'];
+            }
+
+            return Http::response(['message' => 'invalid', 'errors' => $errors], 422);
+        });
+        $this->writeFallback(lines: 2, perLine: 100);
+
+        $this->artisan('processhub:flush-fallback', ['--rate' => 6000])->assertSuccessful();
+
+        $this->assertSame([100, 100], $this->sentSizes());
+        $rejected = array_map(fn ($line) => json_decode($line, true), file($this->path() . '.rejected', FILE_IGNORE_NEW_LINES));
+        $this->assertSame($this->expectedMessages(200), array_column(array_merge(...array_column($rejected, 'entries')), 'message'));
+        $this->assertFileDoesNotExist($this->path() . '.flushing');
+    }
+
+    public function test_leftover_tmp_of_earlier_build_next_to_snapshot_is_removed(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
+        $this->writeFallback(lines: 2, perLine: 50);
+        rename($this->path(), $this->path() . '.flushing');
+        // Прежняя сборка упала, не успев переименовать остаток поверх снапшота.
+        file_put_contents($this->path() . '.flushing.tmp', FallbackFile::line([['level' => 'ERROR', 'message' => 'm-60']], 'flush-fallback remainder'));
+
+        $this->artisan('processhub:flush-fallback')
+            ->expectsOutputToContain('left by an earlier version')
+            ->assertSuccessful();
+
+        $this->assertSame($this->expectedMessages(100), $this->sentMessages());
+        $this->assertFileDoesNotExist($this->path() . '.flushing.tmp');
+        $this->assertFileDoesNotExist($this->path() . '.flushing');
+    }
+
+    public function test_leftover_tmp_of_earlier_build_without_snapshot_is_flushed(): void
+    {
+        Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
+        $this->writeFallback(lines: 1, perLine: 30);
+        rename($this->path(), $this->path() . '.flushing.tmp');
+
+        $this->artisan('processhub:flush-fallback')->assertSuccessful();
+
+        $this->assertSame($this->expectedMessages(30), $this->sentMessages());
+        $this->assertFileDoesNotExist($this->path() . '.flushing.tmp');
+        $this->assertFileDoesNotExist($this->path() . '.flushing');
     }
 
     public function test_nothing_to_flush(): void

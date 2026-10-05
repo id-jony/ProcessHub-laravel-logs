@@ -21,6 +21,7 @@ use ProcessHub\Logs\Commands\ConfigRefreshCommand;
 use ProcessHub\Logs\Commands\ConfigShowCommand;
 use ProcessHub\Logs\Commands\DeployCommand;
 use ProcessHub\Logs\Commands\FlushFallbackCommand;
+use ProcessHub\Logs\Commands\ForgetFailedCommand;
 use ProcessHub\Logs\Commands\HeartbeatCommand;
 use ProcessHub\Logs\Commands\InstallCommand;
 use ProcessHub\Logs\Commands\RebatchQueueCommand;
@@ -75,6 +76,7 @@ class ProcessHubServiceProvider extends ServiceProvider
                 ConfigShowCommand::class,
                 DeployCommand::class,
                 RebatchQueueCommand::class,
+                ForgetFailedCommand::class,
             ]);
         }
 
