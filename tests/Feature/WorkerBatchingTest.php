@@ -4,12 +4,14 @@ namespace ProcessHub\Logs\Tests\Feature;
 
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Queue\Events\JobAttempted;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
+use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Tests\TestCase;
 
 /**
@@ -66,6 +68,36 @@ class WorkerBatchingTest extends TestCase
         );
     }
 
+    public function test_worker_once_unmutes_after_delivery_job_and_drops_its_report(): void
+    {
+        // A payload that can't be decoded: the worker releases the job and
+        // reports a generic exception, not one of isOwnFailure().
+        DB::table('jobs')->insert([
+            'queue' => 'logs',
+            'payload' => json_encode([
+                'uuid' => 'broken', 'displayName' => SendLogBatchJob::class, 'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+                'maxTries' => null, 'timeout' => null, 'data' => ['commandName' => SendLogBatchJob::class, 'command' => 'garbage'],
+            ]),
+            'attempts' => 0, 'reserved_at' => null, 'available_at' => time(), 'created_at' => time(),
+        ]);
+
+        $this->artisan('queue:work', [
+            'connection' => 'database', '--queue' => 'logs', '--once' => true, '--tries' => 0,
+        ])->assertSuccessful();
+
+        $buffer = app(LogBuffer::class);
+        $this->assertSame(0, $buffer->pending());
+        $this->assertSame(1, DB::table('jobs')->where('queue', 'logs')->count());
+
+        if (! class_exists(JobAttempted::class)) {
+            // Laravel 10: the mute lasts until the next loop tick / CommandFinished.
+            return;
+        }
+        $this->assertFalse($buffer->isMuted());
+        Log::warning('after the worker');
+        $this->assertSame(1, $buffer->pending());
+    }
+
     /**
      * @return array<int, array<int, array<string, mixed>>>
      */
@@ -75,8 +107,6 @@ class WorkerBatchingTest extends TestCase
             ->map(fn (string $payload) => unserialize(json_decode($payload, true)['data']['command']))
             ->each(fn ($job) => $this->assertInstanceOf(SendLogBatchJob::class, $job))
             ->map(fn (SendLogBatchJob $job) => $job->entries)
-            // Остаток буфера предыдущего теста, отправленный его деструктором.
-            ->filter(fn (array $entries) => str_starts_with($entries[0]['message'] ?? '', 'job-'))
             ->values()
             ->all();
     }
