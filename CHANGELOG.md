@@ -13,6 +13,12 @@ Fixes a production incident: one queued job per log record + attempt-based
 retries on 429 + `JobFailed` logging failures of the delivery job itself
 formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 
+### Known limitations
+
+- Laravel 10: an out-of-memory fatal error caused by many small allocations
+  may lose the buffer — Laravel 10's shutdown handler needs more memory than
+  it reserves, before any package code runs. Laravel 11+ is not affected.
+
 ### Fixed
 
 - **Remote config is applied safely** — `httpTimeoutSeconds` from the

@@ -39,6 +39,13 @@ class FatalErrorFlushTest extends TestCase
     #[DataProvider('fatalErrors')]
     public function test_buffer_and_fatal_error_are_queued(string $mode, string $class, string $fatalMessage, bool $unreported): void
     {
+        if ($mode === 'memory-small' && version_compare($this->app->version(), '11.0.0', '<')) {
+            // Laravel 10 keeps ~32 KB for its shutdown handler, which allocates
+            // more before any package code runs; whether it fits depends on heap
+            // fragmentation, so the buffer may be lost there (see README).
+            $this->markTestSkipped('Laravel 10: out of memory in small allocations is not guaranteed.');
+        }
+
         $database = tempnam(sys_get_temp_dir(), 'processhub-fatal-');
 
         try {
