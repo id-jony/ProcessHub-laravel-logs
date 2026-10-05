@@ -232,6 +232,24 @@ class IngestThrottleTest extends TestCase
         $this->assertSame(2, IngestThrottle::make()->acquire());
     }
 
+    /**
+     * Laravel sleeps 250 ms between attempts to take a busy lock — under a
+     * few concurrent workers that was the limiter's whole latency (p95 250 ms).
+     */
+    public function test_busy_lock_is_retried_every_20_ms(): void
+    {
+        $slept = [];
+        Sleep::fake(syncWithCarbon: true);
+        Sleep::whenFakingSleep(function ($duration) use (&$slept): void {
+            $slept[] = (int) round($duration->totalMilliseconds);
+        });
+        Cache::store('array')->lock('processhub:ingest-throttle:lock', 60)->get();
+
+        IngestThrottle::make()->acquire();
+
+        $this->assertSame([20], array_values(array_unique($slept)));
+    }
+
     public function test_limiter_stepping_aside_is_reported_once_per_process(): void
     {
         (new \ReflectionProperty(IngestThrottle::class, 'warned'))->setValue(null, false);
@@ -330,7 +348,11 @@ class IngestThrottleTest extends TestCase
     {
         config()->set('processhub.rate_limit_store', $store);
         if ($store === 'file') {
+            // Блокировка — тоже в своём каталоге: по умолчанию lock_path ведёт в общий
+            // storage testbench, а там (bind mount в Docker) гонка fopen/unlink давала
+            // ENOENT → лимитер отходил в сторону и пропускал лишние запросы.
             config()->set('cache.stores.file.path', $dir . '/cache');
+            config()->set('cache.stores.file.lock_path', $dir . '/cache');
         }
         if ($store === 'database') {
             touch($dir . '/cache.sqlite');

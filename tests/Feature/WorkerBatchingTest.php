@@ -2,9 +2,9 @@
 
 namespace ProcessHub\Logs\Tests\Feature;
 
+use Illuminate\Console\Events\CommandFinished;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Database\Schema\Blueprint;
-use Illuminate\Queue\Events\JobAttempted;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -13,6 +13,8 @@ use Illuminate\Support\Facades\Schema;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Tests\TestCase;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 
 /**
  * Real worker over the database queue (sqlite in memory): a worker running
@@ -68,7 +70,7 @@ class WorkerBatchingTest extends TestCase
         );
     }
 
-    public function test_worker_once_unmutes_after_delivery_job_and_drops_its_report(): void
+    public function test_worker_drops_the_report_of_a_failed_delivery_job_and_unmutes_when_done(): void
     {
         // A payload that can't be decoded: the worker releases the job and
         // reports a generic exception, not one of isOwnFailure().
@@ -89,10 +91,8 @@ class WorkerBatchingTest extends TestCase
         $this->assertSame(0, $buffer->pending());
         $this->assertSame(1, DB::table('jobs')->where('queue', 'logs')->count());
 
-        if (! class_exists(JobAttempted::class)) {
-            // Laravel 10: the mute lasts until the next loop tick / CommandFinished.
-            return;
-        }
+        // Artisan в тестах не шлёт CommandFinished — то же, что в конце `php artisan queue:work --once`.
+        event(new CommandFinished('queue:work', new ArrayInput([]), new NullOutput(), 0));
         $this->assertFalse($buffer->isMuted());
         Log::warning('after the worker');
         $this->assertSame(1, $buffer->pending());

@@ -35,6 +35,9 @@ use Illuminate\Support\Facades\File;
  */
 class RemoteConfigClient
 {
+    /** Smallest batch size accepted from the server (see applyToRuntimeConfig()). */
+    public const MIN_REMOTE_BATCH_SIZE = 10;
+
     protected ConfigRepository $config;
 
     /** @var array<string, mixed>|null In-memory cache of the effective config. Null until bootstrap(). */
@@ -195,7 +198,6 @@ class RemoteConfigClient
     protected function applyToRuntimeConfig(array $remote): void
     {
         $map = [
-            'batchSize' => 'processhub.batch_size',
             'heartbeatIntervalSeconds' => 'processhub.heartbeat_interval_seconds',
             'captureQueries' => 'processhub.listeners.query',
             'captureJobs' => 'processhub.listeners.job_failures',
@@ -215,7 +217,14 @@ class RemoteConfigClient
             $this->config->set('processhub.timeout_ms', max(1, min(20, (int) $remote['httpTimeoutSeconds'])) * 1000);
         }
         if (isset($remote['flushIntervalSeconds']) && is_numeric($remote['flushIntervalSeconds'])) {
-            $this->config->set('processhub.flush_interval_sec', max(0, min(60, (int) $remote['flushIntervalSeconds'])));
+            $this->config->set('processhub.flush_interval_sec', max(1, min(60, (int) $remote['flushIntervalSeconds'])));
+        }
+        // Пустое, нулевое или нечисловое значение — опечатка на сервере, а не
+        // «пачка из одной записи»: оставляем локальное. Пачка меньше
+        // MIN_REMOTE_BATCH_SIZE задержку доставки не уменьшает (её задаёт
+        // flushIntervalSeconds), только умножает задачи и POST в общем лимите токена.
+        if (isset($remote['batchSize']) && is_numeric($remote['batchSize']) && $remote['batchSize'] > 0) {
+            $this->config->set('processhub.batch_size', max(self::MIN_REMOTE_BATCH_SIZE, (int) $remote['batchSize']));
         }
         // Extra runtime-only keys read by the Handler directly.
         if (isset($remote['minLevel'])) {

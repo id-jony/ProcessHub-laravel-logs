@@ -52,7 +52,7 @@ abstract class TestCase extends Orchestra
     protected function tearDown(): void
     {
         $path = config('processhub.fallback_path');
-        foreach (['', '.flushing', '.flushing.tmp', '.lock', '.write.lock', '.rejected', '.flushing.offset', '.flushing.offset.tmp'] as $suffix) {
+        foreach (['', '.flushing', '.lock', '.write.lock', '.rejected', '.flushing.offset', '.flushing.offset.tmp'] as $suffix) {
             if ($path && is_file($path . $suffix)) {
                 @unlink($path . $suffix);
             }

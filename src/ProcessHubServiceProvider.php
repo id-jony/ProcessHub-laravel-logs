@@ -8,8 +8,6 @@ use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Http\Kernel;
-use Illuminate\Queue\Events\JobAttempted;
-use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -27,7 +25,6 @@ use ProcessHub\Logs\Commands\InstallCommand;
 use ProcessHub\Logs\Commands\RebatchQueueCommand;
 use ProcessHub\Logs\Commands\TestCommand;
 use ProcessHub\Logs\Config\RemoteConfigClient;
-use ProcessHub\Logs\Exceptions\DeliveryFailedException;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Listeners\HandleExceptionReported;
 use ProcessHub\Logs\Logging\LogBuffer;
@@ -158,11 +155,11 @@ class ProcessHubServiceProvider extends ServiceProvider
 
     /**
      * Everything logged while a worker processes a SendLogBatchJob must not
-     * produce another batch. The worker reports the job's exception after
-     * the attempt (JobAttempted, Laravel 11+) — that exception is remembered
-     * from JobExceptionOccurred. Laravel 10 has no JobAttempted: the mute
-     * lasts until the next loop tick / job / worker stop. A sync job runs
-     * inline (no worker loop to unmute after it) and mutes itself in handle().
+     * produce another batch — including the worker's report of an exception
+     * that escaped the job, which comes after the attempt is over. So the
+     * mute lasts until the worker moves on: next loop tick, next job, worker
+     * stop. A sync job runs inline (no worker loop to unmute after it) and
+     * mutes itself in handle().
      */
     protected function registerDeliveryJobMute(LogBuffer $buffer, Dispatcher $events): void
     {
@@ -172,13 +169,7 @@ class ProcessHubServiceProvider extends ServiceProvider
                 && $event->job->resolveName() === SendLogBatchJob::class,
             );
         });
-        $events->listen(JobExceptionOccurred::class, static function (JobExceptionOccurred $event) use ($buffer): void {
-            if ($event->job->resolveName() === SendLogBatchJob::class) {
-                $buffer->markDeliveryException($event->exception);
-            }
-        });
         $events->listen([
-            JobAttempted::class,
             Looping::class,
             WorkerStopping::class,
             CommandFinished::class,
@@ -221,7 +212,6 @@ class ProcessHubServiceProvider extends ServiceProvider
     {
         $register = function (ExceptionHandler $handler): void {
             try {
-                $this->silenceOwnFailures($handler);
                 HandleExceptionReported::register($handler);
             } catch (\Throwable) {
                 // Non-standard Handler — the user must wire Log::error
@@ -243,22 +233,6 @@ class ProcessHubServiceProvider extends ServiceProvider
                 // No handler bound — nothing to hook into.
             }
         });
-    }
-
-    /**
-     * DeliveryFailedException (and other failures of SendLogBatchJob itself)
-     * would otherwise hit Sentry/daily on every retry attempt. Batches that
-     * finally fail land in the fallback file. HandleExceptionReported stops
-     * them on every Laravel version; dontReportWhen() (Laravel 12+) also
-     * makes shouldReport() say so.
-     */
-    protected function silenceOwnFailures(ExceptionHandler $handler): void
-    {
-        if (method_exists($handler, 'dontReportWhen')) {
-            $handler->dontReportWhen(static fn (\Throwable $e): bool => SendLogBatchJob::isOwnFailure($e));
-        } elseif (method_exists($handler, 'ignore')) {
-            $handler->ignore(DeliveryFailedException::class);
-        }
     }
 
     /**

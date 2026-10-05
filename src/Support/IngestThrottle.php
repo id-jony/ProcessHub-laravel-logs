@@ -2,6 +2,7 @@
 
 namespace ProcessHub\Logs\Support;
 
+use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Contracts\Cache\Repository;
@@ -40,6 +41,9 @@ final class IngestThrottle
     private const LOCK_SECONDS = 5;
 
     private const LOCK_WAIT_SECONDS = 3;
+
+    /** Between attempts to take a busy lock (Laravel's default 250 ms is the whole latency under contention). */
+    private const LOCK_RETRY_MS = 20;
 
     /** A caller comes back up to a second after its turn (queue delays are whole seconds). */
     private const RETURN_SLACK_MS = 1000;
@@ -187,7 +191,12 @@ final class IngestThrottle
             throw new \LogicException('Cache store does not support atomic locks.');
         }
 
-        return $store->lock(self::KEY . ':lock', self::LOCK_SECONDS)->block(self::LOCK_WAIT_SECONDS, $callback);
+        $lock = $store->lock(self::KEY . ':lock', self::LOCK_SECONDS);
+        if ($lock instanceof Lock) {
+            $lock->betweenBlockedAttemptsSleepFor(self::LOCK_RETRY_MS);
+        }
+
+        return $lock->block(self::LOCK_WAIT_SECONDS, $callback);
     }
 
     /**

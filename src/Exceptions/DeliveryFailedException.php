@@ -5,29 +5,15 @@ namespace ProcessHub\Logs\Exceptions;
 use RuntimeException;
 
 /**
- * Raised by SendLogBatchJob when ProcessHub can't accept a batch.
+ * A batch SendLogBatchJob had to park, but the fallback file couldn't take
+ * it — the job fails with this exception and the batch stays in failed_jobs.
  *
- * A dedicated type lets ProcessHubHandler recognise (and drop) reports about
- * its own delivery failures — otherwise every failed delivery would be
- * logged back into the same channel and feed itself.
+ * A dedicated type lets the package recognise (and drop) reports about its
+ * own delivery failures — otherwise they would be logged back into the same
+ * channel and feed themselves.
  */
 final class DeliveryFailedException extends RuntimeException
 {
-    public static function status(int $status, string $body = ''): self
-    {
-        return new self(trim(sprintf(
-            'ProcessHub ingest responded HTTP %d %s',
-            $status,
-            mb_substr($body, 0, 500),
-        )));
-    }
-
-    public static function network(\Throwable $previous): self
-    {
-        return new self('ProcessHub ingest unreachable: ' . $previous->getMessage(), 0, $previous);
-    }
-
-    /** The batch had to be parked, but the fallback file couldn't take it. */
     public static function unparked(string $reason): self
     {
         return new self('ProcessHub log batch could not be written to the fallback file: ' . $reason);

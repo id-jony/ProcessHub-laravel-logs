@@ -26,11 +26,10 @@ use ProcessHub\Logs\Support\LogIngest;
  *      position of the next entry is saved to `<path>.flushing.offset`
  *      (atomic tmp + rename); the next run resumes there. A crash between a
  *      POST and the checkpoint resends one batch: at-least-once, no loss.
+ *      The checkpoint is written once before the first POST: if it can't
+ *      be, the run stops without sending (otherwise every run would resend
+ *      the same first batch).
  *   3. A fully processed snapshot is deleted and the next one is claimed.
- *   4. `<path>.flushing.tmp` left by an earlier 0.4 build (it rewrote the
- *      remainder there before renaming it over the snapshot) is removed when
- *      the snapshot exists — the snapshot holds everything it had — and
- *      adopted as the snapshot otherwise.
  *
  * Delivery:
  *   - requests are paced to --rate per minute;
@@ -161,9 +160,7 @@ class FlushFallbackCommand extends Command
     {
         clearstatcache();
 
-        return (is_file($path) && filesize($path) > 0)
-            || is_file($path . '.flushing')
-            || is_file($path . '.flushing.tmp');
+        return (is_file($path) && filesize($path) > 0) || is_file($path . '.flushing');
     }
 
     /**
@@ -175,7 +172,6 @@ class FlushFallbackCommand extends Command
         $path = $this->path;
         $snapshot = $path . '.flushing';
         clearstatcache();
-        $this->adoptLegacyRemainder($snapshot);
 
         if (is_file($snapshot)) {
             return $snapshot;
@@ -192,28 +188,6 @@ class FlushFallbackCommand extends Command
 
             return @rename($path, $snapshot) ? $snapshot : null;
         });
-    }
-
-    /**
-     * Earlier 0.4 builds wrote the unsent remainder of the snapshot to
-     * `<snapshot>.tmp` and renamed it over the snapshot. A crash before the
-     * rename leaves both — the snapshot is a superset, the copy is dropped;
-     * a copy without a snapshot is the only one left and becomes it.
-     */
-    private function adoptLegacyRemainder(string $snapshot): void
-    {
-        $legacy = $snapshot . '.tmp';
-        if (! is_file($legacy)) {
-            return;
-        }
-
-        if (is_file($snapshot)) {
-            @unlink($legacy);
-            $this->line("Removed {$legacy} left by an earlier version (the snapshot holds all of it).");
-        } elseif (@rename($legacy, $snapshot)) {
-            $this->line("Resuming from {$legacy} left by an earlier version.");
-        }
-        clearstatcache();
     }
 
     /**
@@ -242,6 +216,9 @@ class FlushFallbackCommand extends Command
     {
         $inode = (int) (fstat($fh)['ino'] ?? 0);
         [$offset, $skip] = $this->readCheckpoint($snapshot, $fh, $inode);
+        if (! $this->saveCheckpoint($snapshot, $inode, [$offset, $skip])) {
+            return false;
+        }
         fseek($fh, $offset);
 
         $batcher = BatchBuilder::fromConfig();

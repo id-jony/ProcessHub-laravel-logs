@@ -5,6 +5,7 @@ namespace ProcessHub\Logs\Logging;
 use Monolog\Handler\AbstractProcessingHandler;
 use Monolog\Level;
 use Monolog\LogRecord;
+use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Redaction\Redactor;
 use Symfony\Component\ErrorHandler\Error\FatalError;
 
@@ -51,6 +52,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
         'info'      => 200,
         'notice'    => 250,
         'warning'   => 300,
+        'warn'      => 300, // ProcessHub's own name (INFO/WARN/ERROR)
         'error'     => 400,
         'critical'  => 500,
         'alert'     => 550,
@@ -71,7 +73,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
         // SendLogBatchJob) or reporting its failures would feed back into
         // this very channel — drop them.
         if ($this->buffer->isMuted()
-            || $this->buffer->isDeliveryFailure($record->context['exception'] ?? null)
+            || SendLogBatchJob::isOwnFailure($record->context['exception'] ?? null)
         ) {
             return;
         }
@@ -86,9 +88,10 @@ class ProcessHubHandler extends AbstractProcessingHandler
 
         // Master kill-switch from remote config — when ops flips
         // `enabled = false` in the ProcessHub UI, drop the record before
-        // queueing. Heartbeat refreshes config so the toggle propagates
-        // within ~60s. Server-side ingest also enforces this as a backup.
-        if (config('processhub.enabled', true) === false) {
+        // queueing ("false", 0, "off" too; unknown values keep it on).
+        // Heartbeat refreshes the config file; long-running workers pick it
+        // up after a restart. Server-side ingest also enforces this.
+        if (filter_var(config('processhub.enabled') ?? true, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) === false) {
             return;
         }
 

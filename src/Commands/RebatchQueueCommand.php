@@ -23,8 +23,9 @@ use ProcessHub\Logs\Support\BatchBuilder;
  *   RENAMENX <prefix>queues:logs:notify <prefix>queues:logs-backlog:notify
  * RENAMENX never overwrites a backlog left by a previous run.
  *
- * Pacing: new batches are delayed so that `--rate` of them (default
- * `processhub.rate_limit_per_minute`) become available per minute, evenly
+ * Pacing: new batches are delayed so that `--rate` of them (default 90 %
+ * of `processhub.rate_limit_per_minute`, the rest is left to live traffic)
+ * become available per minute, evenly
  * spaced — each one gets its full retry window from the moment it's due.
  * The schedule continues after whatever already sits in the target queue:
  * after its last delayed job and after its ready + reserved + delayed jobs
@@ -56,7 +57,7 @@ class RebatchQueueCommand extends Command
         {--from= : Name of the backlog queue (e.g. logs-backlog)}
         {--chunk=1000 : Jobs claimed from the backlog per step}
         {--limit= : Max chunks to process in this run}
-        {--rate= : Batches per minute to schedule (default processhub.rate_limit_per_minute, 0 = all at once)}
+        {--rate= : Batches per minute to schedule (default 90% of processhub.rate_limit_per_minute, 0 = all at once)}
         {--start-delay= : Seconds before the first batch is due (default: after what the target queue already holds)}
         {--max-ahead= : Stop once the next batch would be due later than this many minutes (needs --rate > 0)}';
 
@@ -270,7 +271,8 @@ LUA;
     {
         $this->startDelay = 0;
         $rate = $this->option('rate');
-        $this->rate = max(0, $rate !== null ? (int) $rate : (int) config('processhub.rate_limit_per_minute', 50));
+        $limit = (int) config('processhub.rate_limit_per_minute', 50);
+        $this->rate = max(0, $rate !== null ? (int) $rate : ($limit > 0 ? max(1, intdiv($limit * 9, 10)) : 0));
         if ($this->rate === 0) {
             return;
         }

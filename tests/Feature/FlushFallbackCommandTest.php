@@ -153,7 +153,7 @@ class FlushFallbackCommandTest extends TestCase
         Http::fakeSequence('ph.test/*')
             ->push(['ok' => true])
             ->push('', 503)
-            ->push('', 502)
+            ->push('', 408)
             ->whenEmpty(Http::response(['ok' => true]));
         $this->writeFallback(lines: 4, perLine: 70);
 
@@ -394,34 +394,28 @@ class FlushFallbackCommandTest extends TestCase
         $this->assertFileDoesNotExist($this->path() . '.flushing');
     }
 
-    public function test_leftover_tmp_of_earlier_build_next_to_snapshot_is_removed(): void
+    /**
+     * The checkpoint is written after each POST: if it can't be written at
+     * all, every scheduled run would resend the same first batch.
+     */
+    public function test_unwritable_checkpoint_stops_before_sending(): void
     {
         Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
-        $this->writeFallback(lines: 2, perLine: 50);
-        rename($this->path(), $this->path() . '.flushing');
-        // Прежняя сборка упала, не успев переименовать остаток поверх снапшота.
-        file_put_contents($this->path() . '.flushing.tmp', FallbackFile::line([['level' => 'ERROR', 'message' => 'm-60']], 'flush-fallback remainder'));
+        $this->writeFallback(lines: 2, perLine: 100);
+        mkdir($this->path() . '.flushing.offset.tmp');
 
-        $this->artisan('processhub:flush-fallback')
-            ->expectsOutputToContain('left by an earlier version')
-            ->assertSuccessful();
+        try {
+            for ($run = 0; $run < 2; $run++) {
+                $this->artisan('processhub:flush-fallback')
+                    ->expectsOutputToContain('Failed to write')
+                    ->assertFailed();
+            }
+        } finally {
+            rmdir($this->path() . '.flushing.offset.tmp');
+        }
 
-        $this->assertSame($this->expectedMessages(100), $this->sentMessages());
-        $this->assertFileDoesNotExist($this->path() . '.flushing.tmp');
-        $this->assertFileDoesNotExist($this->path() . '.flushing');
-    }
-
-    public function test_leftover_tmp_of_earlier_build_without_snapshot_is_flushed(): void
-    {
-        Http::fake(['ph.test/*' => Http::response(['ok' => true])]);
-        $this->writeFallback(lines: 1, perLine: 30);
-        rename($this->path(), $this->path() . '.flushing.tmp');
-
-        $this->artisan('processhub:flush-fallback')->assertSuccessful();
-
-        $this->assertSame($this->expectedMessages(30), $this->sentMessages());
-        $this->assertFileDoesNotExist($this->path() . '.flushing.tmp');
-        $this->assertFileDoesNotExist($this->path() . '.flushing');
+        Http::assertNothingSent();
+        $this->assertCount(2, file($this->path() . '.flushing'));
     }
 
     public function test_nothing_to_flush(): void

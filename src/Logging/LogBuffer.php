@@ -41,14 +41,6 @@ class LogBuffer
     /** Memory allowed past an exhausted memory_limit to ship the buffer. */
     private const SHUTDOWN_EXTRA_MEMORY = 16 * 1024 * 1024;
 
-    /**
-     * Freed first thing when a fatal error is handled: room to ship the
-     * buffer when memory_limit can't be raised (php_admin_value).
-     */
-    private const RESERVED_MEMORY = 256 * 1024;
-
-    private static ?string $reservedMemory = null;
-
     private ?BatchBuilder $batch = null;
 
     /** Unix time of the oldest buffered entry. */
@@ -67,16 +59,12 @@ class LogBuffer
     /** Process that owns the buffered entries (see claimForCurrentProcess()). */
     private int $pid;
 
-    /** @var \WeakMap<\Throwable, true> exceptions thrown by SendLogBatchJob runs */
-    private \WeakMap $deliveryExceptions;
-
     /** @var \WeakReference<Container>|null */
     private ?\WeakReference $app;
 
     public function __construct(?Container $app = null)
     {
         $this->pid = (int) getmypid();
-        $this->deliveryExceptions = new \WeakMap();
         $this->app = $app !== null ? \WeakReference::create($app) : null;
         self::prepareForFatalError();
     }
@@ -196,9 +184,8 @@ class LogBuffer
 
     /**
      * Mute the buffer while the worker processes a SendLogBatchJob — until
-     * the attempt is over (JobAttempted) or, on Laravel 10, until the worker
-     * moves on (loop tick / stop). The exception the worker reports after
-     * that is recognised by isDeliveryFailure().
+     * the worker moves on (loop tick / next job / stop), so the report of an
+     * exception that escaped the job is muted too.
      */
     public function setInDeliveryJob(bool $inDeliveryJob): void
     {
@@ -220,25 +207,6 @@ class LogBuffer
         if (! $buffered) {
             $this->flush();
         }
-    }
-
-    /**
-     * Remember an exception thrown out of a SendLogBatchJob run (from
-     * JobExceptionOccurred) — the worker reports it afterwards.
-     */
-    public function markDeliveryException(\Throwable $e): void
-    {
-        $this->deliveryExceptions[$e] = true;
-    }
-
-    /**
-     * True for failures of log delivery itself — reporting them into the
-     * ProcessHub channel would create a new batch per failed one.
-     */
-    public function isDeliveryFailure(mixed $e): bool
-    {
-        return SendLogBatchJob::isOwnFailure($e)
-            || ($e instanceof \Throwable && isset($this->deliveryExceptions[$e]));
     }
 
     public function pending(): int
@@ -271,11 +239,7 @@ class LogBuffer
         try {
             SendLogBatchJob::enqueue($entries);
         } catch (\Throwable $e) {
-            // A sync connection runs the job inline and rethrows its failure
-            // after failed() has already parked the batch.
-            if (! $this->isDeliveryFailure($e)) {
-                FallbackFile::append($entries, 'Queue push failed: ' . $e->getMessage());
-            }
+            FallbackFile::append($entries, 'Queue push failed: ' . $e->getMessage());
         } finally {
             $this->flushing = false;
         }
@@ -288,23 +252,16 @@ class LogBuffer
      */
     private static function prepareForFatalError(): void
     {
-        if (self::$reservedMemory !== null) {
-            return;
-        }
-
-        self::$reservedMemory = str_repeat("\0", self::RESERVED_MEMORY);
         class_exists(FatalError::class);
         class_exists(Unlimited::class);
     }
 
     /**
-     * Sentry's approach: drop our reserve and, on "Allowed memory size …
-     * exhausted", raise memory_limit so the buffer can still be shipped.
+     * Sentry's approach: on "Allowed memory size … exhausted" raise
+     * memory_limit so the buffer can still be shipped.
      */
     private static function reclaimMemory(): void
     {
-        self::$reservedMemory = null;
-
         $error = error_get_last();
         if ($error === null
             || preg_match('/^Allowed memory size of (\d+) bytes exhausted/', $error['message'], $m) !== 1
@@ -315,7 +272,8 @@ class LogBuffer
         $limit = (int) $m[1] + self::SHUTDOWN_EXTRA_MEMORY;
         // Лимит ниже текущего потребления ini_set не примет, а его warning
         // обработчик Laravel превратит в исключение; php_admin_value не
-        // поднять вовсе — тогда остаётся только освобождённый резерв.
+        // поднять вовсе — тогда пачка не уйдёт (резерв памяти тут не спасает:
+        // его съедают запись в другие каналы и рендер ошибки).
         if ($limit > memory_get_usage(true)) {
             @ini_set('memory_limit', (string) $limit);
         }

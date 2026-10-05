@@ -12,7 +12,6 @@ use Illuminate\Contracts\Queue\Queue;
 use Illuminate\Foundation\Exceptions\Handler;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Queue\Events\JobAttempted;
-use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -166,24 +165,25 @@ class LogBatchingTest extends TestCase
         $this->assertSame(2, app(LogBuffer::class)->pending());
     }
 
-    public function test_mute_ends_with_the_attempt_and_the_reported_exception_is_dropped(): void
+    /**
+     * Worker::process() → runJob(): an exception that escaped the job is
+     * reported after the attempt is over (after JobAttempted on Laravel 11+)
+     * — the mute lasts until the worker moves on.
+     */
+    public function test_report_of_an_exception_escaping_the_delivery_job_is_dropped(): void
     {
-        if (! class_exists(JobAttempted::class)) {
-            $this->markTestSkipped('JobAttempted appeared in Laravel 11.');
-        }
         QueueFacade::fake();
         config()->set('logging.default', 'processhub');
         $deliveryJob = $this->queueJob(SendLogBatchJob::class);
-        $e = new \RuntimeException('cache store is down');
 
-        // Worker::process() → runJob(): the exception is reported after JobAttempted.
         event(new JobProcessing('redis', $deliveryJob));
-        event(new JobExceptionOccurred('redis', $deliveryJob, $e));
-        event(new JobAttempted('redis', $deliveryJob, true));
-        $this->assertFalse(app(LogBuffer::class)->isMuted());
-        report($e);
+        if (class_exists(JobAttempted::class)) {
+            event(new JobAttempted('redis', $deliveryJob, true));
+        }
+        report(new \RuntimeException('cache store is down'));
         $this->assertSame(0, app(LogBuffer::class)->pending());
 
+        event(new Looping('redis', 'logs'));
         Log::channel('processhub')->error('next');
         $this->assertSame(1, app(LogBuffer::class)->pending());
     }
@@ -257,25 +257,11 @@ class LogBatchingTest extends TestCase
         $deliveryJob = $this->queueJob(SendLogBatchJob::class);
         report(MaxAttemptsExceededException::forJob($deliveryJob));
         report(TimeoutExceededException::forJob($deliveryJob));
-        report(DeliveryFailedException::status(503));
+        report(DeliveryFailedException::unparked('HTTP 401'));
         $this->assertSame([], $reported);
 
         report(MaxAttemptsExceededException::forJob($this->queueJob('App\\Jobs\\SendReceipt')));
         $this->assertCount(1, $reported);
-    }
-
-    public function test_delivery_failures_are_not_reported_on_every_attempt(): void
-    {
-        $handler = app(ExceptionHandler::class);
-
-        $this->assertFalse($handler->shouldReport(DeliveryFailedException::status(503)));
-        $this->assertTrue($handler->shouldReport(new \RuntimeException('business failure')));
-
-        if (method_exists($handler, 'dontReportWhen')) {
-            $deliveryJob = Mockery::mock(Job::class);
-            $deliveryJob->allows('resolveName')->andReturn(SendLogBatchJob::class);
-            $this->assertFalse($handler->shouldReport(MaxAttemptsExceededException::forJob($deliveryJob)));
-        }
     }
 
     public function test_buffer_is_flushed_after_console_command(): void
@@ -377,7 +363,7 @@ class LogBatchingTest extends TestCase
         $deliveryJob = Mockery::mock(Job::class);
         $deliveryJob->allows('resolveName')->andReturn(SendLogBatchJob::class);
 
-        Log::channel('processhub')->error('x', ['exception' => DeliveryFailedException::status(503)]);
+        Log::channel('processhub')->error('x', ['exception' => DeliveryFailedException::unparked('HTTP 401')]);
         Log::channel('processhub')->error('y', ['exception' => MaxAttemptsExceededException::forJob($deliveryJob)]);
         app(LogBuffer::class)->mute(fn () => Log::channel('processhub')->error('z'));
 

@@ -7,6 +7,7 @@ use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\Jobs\SyncJob;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
@@ -19,26 +20,31 @@ use ProcessHub\Logs\Support\LogIngest;
 /**
  * Async delivery of a log batch (up to 100 entries) to ProcessHub.
  *
- * Retry policy is time-based, not attempt-based:
- *   - the batch has `processhub.retry_window_sec` (1h by default, counted
- *     from the moment it becomes available) to get through — `retryDeadline`,
- *     checked by the job itself; attempt counters are irrelevant, so a long
- *     429 streak can't exhaust the job.
- *   - before each POST the shared IngestThrottle is asked for a go; refused →
- *     `release()` until the turn it hands out.
- *   - 429 → global pause for Retry-After + `release()`.
- *   - 5xx / any transport error → DeliveryFailedException, Laravel retries
- *     with `backoff()`.
- *   - 4xx (except 429) is a config problem (bad token, rejected payload) —
- *     retries won't help.
+ * Retry policy is time-based, not attempt-based: the batch has
+ * `processhub.retry_window_sec` (1h by default, counted from the moment it
+ * becomes available) to get through — `retryDeadline`, checked by the job
+ * itself, so a long 429 streak can't exhaust it.
  *
- * Regular dead ends (4xx, deadline passed while the job sat in the queue,
- * next retry wouldn't fit before the deadline) park the batch in the
- * fallback file and delete the job — nothing piles up in failed_jobs;
- * `processhub:flush-fallback` re-ingests it later. The worker's own
- * `retryUntil()` is the deadline plus a day, so it never fails the job by
+ * Every expected failure ends the attempt with `release()`; nothing is thrown
+ * out of handle() — the worker would report it and, on messages like
+ * "Connection reset by peer", restart itself:
+ *   - the shared IngestThrottle refuses → until the turn it hands out;
+ *   - 429 → global pause for Retry-After;
+ *   - 408 / 5xx / any error of the HTTP call → `backoff()`.
+ * Other 4xx is a config problem (bad token, rejected payload) — retries won't
+ * help.
+ *
+ * Dead ends (4xx, deadline passed while the job sat in the queue, next retry
+ * wouldn't fit before the deadline, a sync queue that can't delay) park the
+ * batch in the fallback file and delete the job — nothing piles up in
+ * failed_jobs; `processhub:flush-fallback` re-ingests it later. The worker's
+ * own `retryUntil()` is the deadline plus a day, so it never fails the job by
  * time first. `failed()` stays as a safety net for what the job can't
- * intercept (timeouts) and for a batch the fallback file can't take.
+ * intercept (timeouts).
+ *
+ * A job queued by 0.3 has no `retryDeadline`: it is sent only if the throttle
+ * lets it through right away (it never takes a turn in the throttle's queue)
+ * and is never retried — anything but success parks it.
  */
 class SendLogBatchJob implements ShouldQueue
 {
@@ -57,10 +63,7 @@ class SendLogBatchJob implements ShouldQueue
      */
     private const WORKER_GRACE_SECONDS = 86_400;
 
-    /**
-     * Unix time until which delivery is retried. Null in jobs serialized by
-     * older package versions — their deadline is the payload's retryUntil.
-     */
+    /** Unix time until which delivery is retried. Null in jobs queued by 0.3. */
     public ?int $retryDeadline = null;
 
     /**
@@ -83,7 +86,23 @@ class SendLogBatchJob implements ShouldQueue
      */
     public static function enqueue(array $entries, int $delaySeconds = 0): void
     {
-        self::push(new self($entries, $delaySeconds), $delaySeconds);
+        $job = new self($entries, $delaySeconds);
+        $queueName = config('processhub.queue');
+        $connection = config('processhub.connection');
+
+        if ($queueName) {
+            $job->onQueue($queueName);
+        }
+        if ($connection) {
+            $job->onConnection($connection);
+        }
+
+        $queue = app(QueueFactory::class)->connection($connection);
+        if ($delaySeconds > 0) {
+            $queue->laterOn($queueName, $delaySeconds, $job);
+        } else {
+            $queue->pushOn($queueName, $job);
+        }
     }
 
     /**
@@ -144,7 +163,10 @@ class SendLogBatchJob implements ShouldQueue
      */
     public function failed(\Throwable $exception): void
     {
-        FallbackFile::append($this->entries, $exception->getMessage());
+        // park() не смог записать пачку в файл — она остаётся только в failed_jobs.
+        if (! $exception instanceof DeliveryFailedException) {
+            FallbackFile::append($this->entries, $exception->getMessage());
+        }
     }
 
     private function deliver(string $url, string $token): void
@@ -156,9 +178,13 @@ class SendLogBatchJob implements ShouldQueue
         }
 
         $throttle = IngestThrottle::make();
-        $wait = $throttle->acquire($this->maxWait(), newcomer: $this->attempts() === 1);
+        // Задача 0.3 берёт только свободный слот: в очередь ходов она не встаёт
+        // и не обгоняет тех, кто ждёт в ней.
+        $wait = $this->retryDeadline === null
+            ? $throttle->acquire(0, newcomer: true)
+            : $throttle->acquire($this->retryDeadline - now()->getTimestamp() - $this->timeout, newcomer: $this->attempts() === 1);
         if ($wait > 0) {
-            $this->releaseOrPark($wait, 'Local rate limit');
+            $this->retryLater($wait, 'Local rate limit');
 
             return;
         }
@@ -166,7 +192,7 @@ class SendLogBatchJob implements ShouldQueue
         try {
             $response = LogIngest::post($url, $token, $this->entries);
         } catch (\Throwable $e) {
-            $this->throwOrPark(DeliveryFailedException::network($e));
+            $this->retryLater($this->backoffDelay(), 'ProcessHub ingest unreachable: ' . $e->getMessage());
 
             return;
         }
@@ -176,116 +202,52 @@ class SendLogBatchJob implements ShouldQueue
         }
 
         $status = $response->status();
+        $reason = 'ProcessHub ingest responded HTTP ' . $status;
 
         if ($status === 429) {
             $wait = LogIngest::retryAfter($response);
             $throttle->pauseFor($wait);
-            $this->releaseOrPark($wait, 'ProcessHub ingest responded HTTP 429');
-
-            return;
-        }
-
-        if ($status >= 400 && $status < 500) {
-            $this->park(DeliveryFailedException::status($status, $response->body())->getMessage());
-
-            return;
-        }
-
-        $this->throwOrPark(DeliveryFailedException::status($status));
-    }
-
-    private function releaseOrPark(int $delay, string $reason): void
-    {
-        if (! $this->fitsBeforeDeadline($delay)) {
-            $this->park($reason . '; retry window exhausted');
-        } elseif ($this->isLegacy()) {
-            $this->requeue($delay);
+            $this->retryLater($wait, $reason);
+        } elseif ($status >= 400 && $status < 500 && $status !== 408) {
+            $this->park(trim($reason . ' ' . mb_substr($response->body(), 0, 500)));
         } else {
-            $this->release($delay);
+            $this->retryLater($this->backoffDelay(), $reason);
         }
     }
 
     /**
-     * Throw for a regular backoff retry, unless that retry would come after
-     * the deadline — then park the batch now.
+     * Release the job for another attempt after $delay — or park the batch
+     * now when there will be no such attempt.
      */
-    private function throwOrPark(DeliveryFailedException $e): void
+    private function retryLater(int $delay, string $reason): void
+    {
+        $obstacle = match (true) {
+            $this->retryDeadline === null => 'job queued by 0.3 is not retried',
+            $this->job === null || $this->job instanceof SyncJob => 'sync queue can\'t retry',
+            ! $this->fitsBeforeDeadline($delay) => 'retry window exhausted',
+            default => null,
+        };
+
+        if ($obstacle === null) {
+            $this->release($delay);
+        } else {
+            $this->park($reason . '; ' . $obstacle);
+        }
+    }
+
+    /** Delay before the next attempt after a failed POST. */
+    private function backoffDelay(): int
     {
         $backoff = $this->backoff();
-        $delay = $backoff[$this->attempts() - 1] ?? end($backoff);
-        if (! $this->fitsBeforeDeadline($delay)) {
-            $this->park($e->getMessage() . '; retry window exhausted');
 
-            return;
-        }
-
-        if (! $this->isLegacy()) {
-            throw $e;
-        }
-
-        $this->requeue($delay);
+        return $backoff[$this->attempts() - 1] ?? end($backoff);
     }
 
     /** The next attempt starts after $delay and still has a full $timeout before the deadline. */
     private function fitsBeforeDeadline(int $delay): bool
     {
-        $deadline = $this->deadline();
-
-        return $deadline === null || now()->getTimestamp() + $delay + $this->timeout <= $deadline;
-    }
-
-    /** Longest wait for the throttle that still fits before the deadline. */
-    private function maxWait(): ?int
-    {
-        $deadline = $this->deadline();
-
-        return $deadline === null ? null : $deadline - now()->getTimestamp() - $this->timeout;
-    }
-
-    /**
-     * Older jobs carry no `retryDeadline`: queued by 0.4 pre-releases, their
-     * payload has the deadline as `retryUntil`; queued by 0.3 — none at all.
-     */
-    private function deadline(): ?int
-    {
-        $deadline = $this->retryDeadline ?? $this->job?->retryUntil();
-
-        return $deadline === null ? null : (int) $deadline;
-    }
-
-    /**
-     * A 0.3 payload has `maxTries` 3 and no `retryUntil`: every `release()`
-     * brings it closer to MaxAttemptsExceeded — it's retried as a new job.
-     */
-    private function isLegacy(): bool
-    {
-        return $this->retryDeadline === null && $this->job !== null && $this->job->retryUntil() === null;
-    }
-
-    private function requeue(int $delay): void
-    {
-        self::push(new self($this->entries, $delay), $delay);
-        $this->delete();
-    }
-
-    private static function push(self $job, int $delaySeconds): void
-    {
-        $queueName = config('processhub.queue');
-        $connection = config('processhub.connection');
-
-        if ($queueName) {
-            $job->onQueue($queueName);
-        }
-        if ($connection) {
-            $job->onConnection($connection);
-        }
-
-        $queue = app(QueueFactory::class)->connection($connection);
-        if ($delaySeconds > 0) {
-            $queue->laterOn($queueName, $delaySeconds, $job);
-        } else {
-            $queue->pushOn($queueName, $job);
-        }
+        return $this->retryDeadline === null
+            || now()->getTimestamp() + $delay + $this->timeout <= $this->retryDeadline;
     }
 
     private function park(string $reason): void
@@ -296,22 +258,22 @@ class SendLogBatchJob implements ShouldQueue
             if ($this->job === null) {
                 throw $e;
             }
-            Log::error('ProcessHub log batch could not be moved to the fallback file', [
-                'reason' => $reason,
-                'entries' => count($this->entries),
-            ]);
             $this->fail($e);
 
             return;
         }
 
         $this->delete();
-        Log::warning(config('processhub.fallback_path')
-            ? 'ProcessHub log batch moved to the fallback file'
-            : 'ProcessHub log batch dropped: fallback file is disabled', [
-            'reason' => $reason,
-            'entries' => count($this->entries),
-        ]);
+        try {
+            Log::warning(config('processhub.fallback_path')
+                ? 'ProcessHub log batch moved to the fallback file'
+                : 'ProcessHub log batch dropped: fallback file is disabled', [
+                'reason' => $reason,
+                'entries' => count($this->entries),
+            ]);
+        } catch (\Throwable) {
+            // Пачка уже в файле — сбой канала логов задачу не валит.
+        }
     }
 
     /**

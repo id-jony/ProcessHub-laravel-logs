@@ -116,6 +116,21 @@ class RebatchQueueCommandTest extends TestCase
         $this->assertSame([0, 60, 120, 130, 140], array_keys($this->schedule()));
     }
 
+    /** By default the backlog gets 90 % of the limit — the rest is left to live traffic. */
+    public function test_default_rate_leaves_a_tenth_of_the_limit_to_live_traffic(): void
+    {
+        $this->freezeTime();
+        config()->set('processhub.batch_size', 10);
+        config()->set('processhub.rate_limit_per_minute', 50);
+        $this->backlog(60);
+
+        $this->artisan('processhub:rebatch-queue', ['--from' => 'logs-backlog'])
+            ->expectsOutputToContain('Paced at 45 batches/min')
+            ->assertSuccessful();
+
+        $this->assertSame([0, 1, 2, 4, 5, 6], array_keys($this->schedule()));
+    }
+
     public function test_max_ahead_leaves_the_rest_for_the_next_run(): void
     {
         $this->freezeTime();

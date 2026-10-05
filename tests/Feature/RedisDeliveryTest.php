@@ -5,6 +5,7 @@ namespace ProcessHub\Logs\Tests\Feature;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Psr7\Request as GuzzleRequest;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Support\Facades\Event;
@@ -13,7 +14,7 @@ use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
-use ProcessHub\Logs\Support\IngestThrottle;
+use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Tests\Concerns\UsesRedis;
 use ProcessHub\Logs\Tests\TestCase;
 
@@ -63,13 +64,18 @@ class RedisDeliveryTest extends TestCase
 
     /**
      * Laravel 11 lets a reset connection (cURL 56), TLS or HTTP/2 error out
-     * of the HTTP client as a raw Guzzle RequestException. If it isn't
-     * recognised as our own failure, the worker's report() logs it into the
-     * processhub channel — a new job per failed attempt, 1 → 2 → 4 → …
+     * of the HTTP client as a raw Guzzle RequestException. Thrown out of the
+     * job, it was reported by the worker (into the processhub channel — a new
+     * job per failed attempt) and its "Connection reset by peer" made the
+     * worker quit as if it had lost the queue connection.
      */
     public function test_transport_error_does_not_multiply_jobs(): void
     {
         config()->set('logging.default', 'processhub');
+        $exceptions = 0;
+        Event::listen(JobExceptionOccurred::class, function () use (&$exceptions) {
+            $exceptions++;
+        });
         $posts = 0;
         Http::fake(function ($request) use (&$posts) {
             $posts++;
@@ -84,11 +90,15 @@ class RedisDeliveryTest extends TestCase
 
         for ($i = 0; $i < 4; $i++) {
             $this->artisan('queue:work', ['connection' => 'redis', '--queue' => 'logs', '--once' => true]);
+            $this->assertFalse(app('queue.worker')->shouldQuit, 'worker took the error for a lost connection');
             $this->travel(301)->seconds();
         }
 
         $this->assertSame(1, Queue::connection('redis')->size('logs'));
         $this->assertSame(4, $posts);
+        $this->assertSame(0, $exceptions);
+        app(LogBuffer::class)->flush();
+        $this->assertSame(1, Queue::connection('redis')->size('logs'));
     }
 
     public function test_rebatch_queue_repacks_backlog_into_full_batches(): void
@@ -224,35 +234,33 @@ class RedisDeliveryTest extends TestCase
     }
 
     /**
-     * A job queued by 0.3 (`maxTries` 3, no `retryUntil`) must not run out of
-     * attempts while the limiter keeps it waiting.
+     * Jobs queued by 0.3 (`maxTries` 3, no `retryUntil`) left in `logs` after
+     * the upgrade: sent while the limiter has free capacity, parked otherwise
+     * — never re-queued, never in failed_jobs, and they don't push fresh
+     * batches' turns hours ahead.
      */
-    public function test_job_queued_by_v03_survives_local_rate_limit(): void
+    public function test_backlog_of_v03_jobs_is_parked_without_delaying_fresh_batches(): void
     {
+        $this->freezeSecond();
         Http::fake(['ph.test/*' => Http::response(['accepted' => 1])]);
         $failed = $this->countFailedJobs();
-        $command = preg_replace('/s:13:"retryDeadline";i:\d+;/', 's:5:"tries";i:3;', serialize(
-            (new SendLogBatchJob([['level' => 'WARNING', 'message' => 'legacy']]))->onConnection('redis')->onQueue('logs'),
-        ), 1, $replaced);
-        $this->assertSame(1, $replaced);
-        Queue::connection('redis')->pushRaw((string) json_encode([
-            'uuid' => (string) Str::uuid(), 'displayName' => SendLogBatchJob::class,
-            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call', 'maxTries' => 3, 'maxExceptions' => null,
-            'failOnTimeout' => false, 'backoff' => null, 'timeout' => 30, 'retryUntil' => null,
-            'data' => ['commandName' => SendLogBatchJob::class, 'command' => $command], 'attempts' => 0,
-        ]), 'logs');
-
-        for ($i = 0; $i < 5; $i++) {
-            IngestThrottle::make()->pauseFor(5);
-            $this->work();
-            $this->travel(6)->seconds();
+        for ($i = 0; $i < 100; $i++) {
+            $this->pushV03Job('legacy-' . $i);
         }
-        $this->work();
+        SendLogBatchJob::enqueue([['level' => 'ERROR', 'message' => 'fresh']]);
 
+        $this->artisan('queue:work', ['connection' => 'redis', '--queue' => 'logs', '--stop-when-empty' => true]);
+
+        // Burst of 5 went to 0.3 jobs, 95 parked; the fresh batch waits one interval.
+        Http::assertSentCount(5);
         $this->assertSame(0, $failed->count);
-        Http::assertSentCount(1);
+        $this->assertCount(95, file(config('processhub.fallback_path')));
+        $this->assertSame([2], array_keys($this->scheduledBatches()));
+
+        $this->travel(2)->seconds();
+        $this->work();
+        Http::assertSent(fn ($request) => $request['logs'][0]['message'] === 'fresh');
         $this->assertSame(0, Queue::connection('redis')->size('logs'));
-        $this->assertFileDoesNotExist(config('processhub.fallback_path'));
     }
 
     /**
@@ -328,6 +336,20 @@ class RedisDeliveryTest extends TestCase
         ksort($scheduled);
 
         return $scheduled;
+    }
+
+    private function pushV03Job(string $message): void
+    {
+        $command = preg_replace('/s:13:"retryDeadline";i:\d+;/', 's:5:"tries";i:3;', serialize(
+            (new SendLogBatchJob([['level' => 'WARNING', 'message' => $message]]))->onConnection('redis')->onQueue('logs'),
+        ), 1, $replaced);
+        $this->assertSame(1, $replaced);
+        Queue::connection('redis')->pushRaw((string) json_encode([
+            'uuid' => (string) Str::uuid(), 'displayName' => SendLogBatchJob::class,
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call', 'maxTries' => 3, 'maxExceptions' => null,
+            'failOnTimeout' => false, 'backoff' => null, 'timeout' => 30, 'retryUntil' => null,
+            'data' => ['commandName' => SendLogBatchJob::class, 'command' => $command], 'attempts' => 0,
+        ]), 'logs');
     }
 
     private function work(): void

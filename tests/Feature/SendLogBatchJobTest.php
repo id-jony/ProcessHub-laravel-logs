@@ -168,26 +168,77 @@ class SendLogBatchJobTest extends TestCase
         $this->assertTrue($job->failOnTimeout);
     }
 
-    public function test_server_error_throws_for_backoff_retry(): void
+    /**
+     * @return array<string, array{0: int, 1: int, 2: int}>
+     */
+    public static function temporaryStatuses(): array
     {
-        Http::fake(['ph.test/*' => Http::response('', 503)]);
-        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) {
-            $queueJob->allows('attempts')->andReturn(1);
-            $queueJob->shouldNotReceive('release');
+        return [
+            '503, 1st attempt' => [503, 1, 10],
+            '500, 3rd attempt' => [500, 3, 120],
+            '408 is temporary too' => [408, 2, 30],
+            'past the backoff list' => [502, 9, 300],
+        ];
+    }
+
+    /**
+     * Expected failures end the attempt with release() — an exception would
+     * be reported by the worker and, for some messages, restart it.
+     */
+    #[DataProvider('temporaryStatuses')]
+    public function test_temporary_error_releases_with_backoff(int $status, int $attempts, int $delay): void
+    {
+        Http::fake(['ph.test/*' => Http::response('', $status)]);
+        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) use ($attempts, $delay) {
+            $queueJob->allows('attempts')->andReturn($attempts);
+            $queueJob->shouldReceive('release')->once()->with($delay);
             $queueJob->shouldNotReceive('delete');
+            $queueJob->shouldNotReceive('fail');
         });
 
-        $this->expectException(DeliveryFailedException::class);
+        $job->handle();
+
+        $this->assertFileDoesNotExist(config('processhub.fallback_path'));
+    }
+
+    /**
+     * @return array<string, array{0: \Closure(): never}>
+     */
+    public static function transportErrors(): array
+    {
+        return [
+            'connection exception' => [fn () => throw new ConnectionException('Connection refused')],
+            // Laravel 11 не оборачивает обрыв соединения, TLS, HTTP/2 в ConnectionException.
+            'raw guzzle exception' => [fn ($request) => throw new RequestException(
+                'cURL error 56: Recv failure: Connection reset by peer',
+                new GuzzleRequest('POST', $request->url()),
+            )],
+            'runtime exception' => [fn () => throw new \RuntimeException('Connection reset by peer')],
+            'type error' => [fn () => throw new \TypeError('client bug')],
+        ];
+    }
+
+    #[DataProvider('transportErrors')]
+    public function test_any_error_of_the_http_call_releases_with_backoff(\Closure $failure): void
+    {
+        Http::fake($failure);
+        $job = $this->jobWithQueueMock([['message' => 'a']], function ($queueJob) {
+            $queueJob->shouldReceive('release')->once()->with(10);
+            $queueJob->shouldNotReceive('fail');
+        });
+
         $job->handle();
     }
 
-    public function test_network_error_throws_delivery_exception(): void
+    public function test_job_without_a_queue_to_retry_on_parks_the_batch(): void
     {
         Http::fake(fn () => throw new ConnectionException('Connection refused'));
-        $job = new SendLogBatchJob([['message' => 'a']]);
 
-        $this->expectException(DeliveryFailedException::class);
-        $job->handle();
+        (new SendLogBatchJob([['message' => 'inline']]))->handle();
+
+        $line = json_decode(trim((string) file_get_contents(config('processhub.fallback_path'))), true);
+        $this->assertSame('inline', $line['entries'][0]['message']);
+        $this->assertStringContainsString("sync queue can't retry", $line['reason']);
     }
 
     public function test_client_error_parks_batch_in_fallback_without_failing_the_job(): void
@@ -204,27 +255,6 @@ class SendLogBatchJobTest extends TestCase
         $line = json_decode(trim((string) file_get_contents(config('processhub.fallback_path'))), true);
         $this->assertSame([['message' => 'rejected']], $line['entries']);
         $this->assertStringContainsString('HTTP 401', $line['reason']);
-    }
-
-    /**
-     * Laravel 11 doesn't wrap a reset connection / TLS / HTTP/2 error into
-     * ConnectionException — the raw Guzzle exception must still become ours.
-     */
-    public function test_raw_guzzle_transport_error_becomes_delivery_exception(): void
-    {
-        Http::fake(fn ($request) => throw new RequestException(
-            'cURL error 56: Recv failure: Connection reset by peer',
-            new GuzzleRequest('POST', $request->url()),
-        ));
-        $job = new SendLogBatchJob([['message' => 'a']]);
-
-        try {
-            $job->handle();
-            $this->fail('DeliveryFailedException expected');
-        } catch (DeliveryFailedException $e) {
-            $this->assertTrue(SendLogBatchJob::isOwnFailure($e));
-            $this->assertStringContainsString('cURL error 56', $e->getMessage());
-        }
     }
 
     public function test_unencodable_values_do_not_break_the_batch(): void
@@ -382,31 +412,6 @@ class SendLogBatchJobTest extends TestCase
         $this->assertSame(now()->getTimestamp() + 4200 + 86_400, $job->retryUntil()->getTimestamp());
     }
 
-    public function test_job_serialized_by_older_version_uses_payload_deadline(): void
-    {
-        Http::fake(['ph.test/*' => Http::response('', 503)]);
-        $class = SendLogBatchJob::class;
-        // Shape of a job queued before `retryDeadline` existed.
-        $job = unserialize(sprintf(
-            'O:%d:"%s":2:{s:7:"entries";a:1:{i:0;a:1:{s:7:"message";s:3:"old";}}s:13:"maxExceptions";i:10;}',
-            strlen($class),
-            $class,
-        ));
-        $this->assertInstanceOf(SendLogBatchJob::class, $job);
-        $this->assertNull($job->retryDeadline);
-
-        $queueJob = Mockery::mock(Job::class);
-        $queueJob->allows('attempts')->andReturn(1);
-        // 503 → backoff 10 s + 30 s timeout no longer fit before the payload deadline.
-        $queueJob->allows('retryUntil')->andReturn(now()->getTimestamp() + 35);
-        $queueJob->shouldReceive('delete')->once();
-        $job->setJob($queueJob);
-
-        $job->handle();
-
-        $this->assertFileExists(config('processhub.fallback_path'));
-    }
-
     public function test_job_picked_up_after_its_deadline_parks_batch_without_posting(): void
     {
         Http::fake();
@@ -438,6 +443,49 @@ class SendLogBatchJobTest extends TestCase
         $job->handle();
     }
 
+    /**
+     * fail() comes first: a broken log channel must not keep the batch out of
+     * failed_jobs (it would be retried by backoff for a day instead).
+     */
+    public function test_unwritable_fallback_fails_job_even_when_logging_is_broken(): void
+    {
+        config()->set('processhub.fallback_path', '/nonexistent-dir/processhub-fallback.log');
+        $this->breakLogging();
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+        $job = $this->jobWithQueueMock([['message' => 'precious']], function ($queueJob) {
+            $queueJob->shouldReceive('fail')->once()->with(Mockery::type(DeliveryFailedException::class));
+        });
+
+        $job->handle();
+    }
+
+    public function test_parked_batch_survives_broken_logging(): void
+    {
+        $this->breakLogging();
+        Http::fake(['ph.test/*' => Http::response(['error' => 'bad token'], 401)]);
+        $job = $this->jobWithQueueMock([['message' => 'parked']], function ($queueJob) {
+            $queueJob->shouldReceive('delete')->once();
+        });
+
+        $job->handle();
+
+        $this->assertStringContainsString('parked', (string) file_get_contents(config('processhub.fallback_path')));
+    }
+
+    /**
+     * failed() after park() couldn't write the file must not write the batch
+     * there after all — it would end up both in the file and in failed_jobs
+     * (and come back twice through queue:retry).
+     */
+    public function test_failed_after_unwritable_fallback_does_not_append_again(): void
+    {
+        $job = new SendLogBatchJob([['message' => 'once']]);
+
+        $job->failed(DeliveryFailedException::unparked('HTTP 401'));
+
+        $this->assertFileDoesNotExist(config('processhub.fallback_path'));
+    }
+
     public function test_unwritable_fallback_without_queue_throws(): void
     {
         config()->set('processhub.fallback_path', '/nonexistent-dir/processhub-fallback.log');
@@ -457,23 +505,87 @@ class SendLogBatchJobTest extends TestCase
         $this->assertSame(['ok'], array_column(array_slice($job->entries, 1), 'message'));
     }
 
-    public function test_job_queued_by_v03_is_retried_as_a_new_job(): void
+    /**
+     * @return array<string, array{0: int}>
+     */
+    public static function legacyFailures(): array
+    {
+        return ['503' => [503], '408' => [408], '429' => [429], '401' => [401]];
+    }
+
+    /**
+     * A job queued by 0.3 has no deadline: it isn't retried and isn't
+     * re-queued — the batch goes to the fallback file (flush-fallback sends
+     * it later, packed into full batches).
+     */
+    #[DataProvider('legacyFailures')]
+    public function test_job_queued_by_v03_is_parked_instead_of_retried(int $status): void
     {
         Queue::fake();
-        Http::fake(['ph.test/*' => Http::response('', 503)]);
+        Http::fake(['ph.test/*' => Http::response('', $status)]);
         $job = $this->legacyJob();
         $queueJob = Mockery::mock(Job::class);
-        // Payload 0.3: maxTries 3, retryUntil нет — release() на 3-й попытке дал бы MaxAttemptsExceeded.
-        $queueJob->allows('attempts')->andReturn(3);
-        $queueJob->allows('retryUntil')->andReturn(null);
+        $queueJob->allows('attempts')->andReturn(1);
         $queueJob->shouldReceive('delete')->once();
         $queueJob->shouldNotReceive('release');
         $job->setJob($queueJob);
 
         $job->handle();
 
-        Queue::assertPushed(SendLogBatchJob::class, fn (SendLogBatchJob $retry) => $retry->entries === [['message' => 'old']]
-            && $retry->retryDeadline === now()->getTimestamp() + 120 + 3600);
+        Queue::assertNothingPushed();
+        $line = json_decode(trim((string) file_get_contents(config('processhub.fallback_path'))), true);
+        $this->assertSame([['message' => 'old']], $line['entries']);
+    }
+
+    /**
+     * The limiter's queue of turns belongs to jobs with a deadline. 0.3 jobs
+     * (a backlog of thousands after the upgrade) used to take a turn each and
+     * push it hours ahead — every fresh batch then missed its window and
+     * went to the fallback file.
+     */
+    public function test_jobs_queued_by_v03_do_not_take_turns_in_the_limiter(): void
+    {
+        config()->set('processhub.rate_limit_store', 'array');
+        $this->freezeSecond();
+        Queue::fake();
+        Http::fake(['ph.test/*' => Http::response(['accepted' => 1])]);
+
+        for ($i = 0; $i < 200; $i++) {
+            $queueJob = Mockery::mock(Job::class);
+            $queueJob->allows('attempts')->andReturn(2);
+            $queueJob->allows('delete');
+            $queueJob->shouldNotReceive('release');
+            $this->legacyJob()->setJob($queueJob)->handle();
+        }
+
+        // Burst of 5 went out; the rest was parked, nothing re-queued.
+        Http::assertSentCount(5);
+        Queue::assertNothingPushed();
+        $this->assertCount(195, file(config('processhub.fallback_path')));
+
+        // A fresh batch is told to come back after one interval, not after 195 of them.
+        $this->jobWithQueueMock([['message' => 'fresh']], fn ($queueJob) => $queueJob->shouldReceive('release')->once()->with(2))->handle();
+    }
+
+    /** A 0.3 job doesn't jump ahead of jobs waiting for their turn either. */
+    public function test_job_queued_by_v03_does_not_take_a_waiting_jobs_turn(): void
+    {
+        config()->set('processhub.rate_limit_store', 'array');
+        config()->set('processhub.rate_limit_per_minute', 6);
+        $this->freezeSecond();
+        Http::fake(['ph.test/*' => Http::response(['accepted' => 1])]);
+
+        $this->jobWithQueueMock([['message' => 'first']], fn ($queueJob) => $queueJob->shouldNotReceive('release'))->handle();
+        $this->jobWithQueueMock([['message' => 'waits']], fn ($queueJob) => $queueJob->shouldReceive('release')->once()->with(10))->handle();
+        $this->travel(10)->seconds();
+
+        $queueJob = Mockery::mock(Job::class);
+        $queueJob->allows('attempts')->andReturn(1);
+        $queueJob->shouldReceive('delete')->once();
+        $this->legacyJob()->setJob($queueJob)->handle();
+
+        Http::assertSentCount(1);
+        $this->assertStringContainsString('job queued by 0.3 is not retried', (string) file_get_contents(config('processhub.fallback_path')));
     }
 
     /**
@@ -484,7 +596,7 @@ class SendLogBatchJobTest extends TestCase
         $own = SendLogBatchJob::class;
 
         return [
-            'delivery' => [DeliveryFailedException::status(503), true],
+            'unparked batch' => [DeliveryFailedException::unparked('HTTP 401'), true],
             'attempts, L10 message' => [new MaxAttemptsExceededException($own . ' has been attempted too many times or run too long. The job may have previously timed out.'), true],
             'other job, L10 message' => [new MaxAttemptsExceededException('App\Jobs\Foo has been attempted too many times.'), false],
             'unrelated' => [new \RuntimeException($own . ' has failed'), false],
@@ -522,6 +634,12 @@ class SendLogBatchJobTest extends TestCase
         $this->assertInstanceOf(SendLogBatchJob::class, $job);
 
         return $job;
+    }
+
+    private function breakLogging(): void
+    {
+        config()->set('logging.channels.broken', ['driver' => 'monolog', 'handler' => \Monolog\Handler\StreamHandler::class, 'with' => ['stream' => '/nonexistent-dir/laravel.log']]);
+        config()->set('logging.default', 'broken');
     }
 
     /**

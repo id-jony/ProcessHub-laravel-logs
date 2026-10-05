@@ -2,11 +2,14 @@
 
 namespace ProcessHub\Logs\Tests\Feature;
 
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
+use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Tests\Concerns\UsesRedis;
 use ProcessHub\Logs\Tests\TestCase;
 
@@ -46,6 +49,7 @@ class DeliveryLoopTest extends TestCase
         }
 
         $this->assertSame(3, $this->attempts);
+        app(LogBuffer::class)->flush();
         $this->assertSame([['original']], $this->queuedMessages());
     }
 
@@ -60,6 +64,31 @@ class DeliveryLoopTest extends TestCase
         ])->assertSuccessful();
 
         $this->assertSame(1, $this->attempts);
+        $this->assertSame([['original']], $this->queuedMessages());
+    }
+
+    /**
+     * An exception that escapes handle() (a bug, not a delivery failure) is
+     * reported by the worker after the attempt — still not into processhub.
+     */
+    public function test_exception_escaping_the_job_is_not_logged_back(): void
+    {
+        Http::fake();
+        $reported = 0;
+        Event::listen(JobExceptionOccurred::class, function () use (&$reported) {
+            $reported++;
+        });
+
+        SendLogBatchJob::enqueue([['level' => 'ERROR', 'message' => 'original']]);
+        // Не строка — deliver(string $url) бросит TypeError мимо обработки сбоев доставки.
+        config()->set('processhub.url', ['https://ph.test']);
+
+        $this->artisan('queue:work', [
+            'connection' => 'redis', '--queue' => 'logs', '--max-jobs' => 1, '--sleep' => 0,
+        ])->assertSuccessful();
+        app(LogBuffer::class)->flush();
+
+        $this->assertSame(1, $reported);
         $this->assertSame([['original']], $this->queuedMessages());
     }
 
