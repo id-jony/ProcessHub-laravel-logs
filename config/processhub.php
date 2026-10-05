@@ -32,6 +32,11 @@ return [
     | retry_window_sec — сколько секунд SendLogBatchJob пытается доставить
     |              пачку (429 ждёт Retry-After и попыток не тратит), потом —
     |              fallback-файл.
+    | rate_limit_per_minute — общий для всех процессов лимит POST в
+    |              /api/ingest/logs (ProcessHub пускает 60/мин на токен;
+    |              50 оставляет запас под heartbeat и прочее). 0 — без лимита.
+    | rate_limit_store — cache store для счётчика лимита (null — cache.default).
+    |              Нужен общий для всех воркеров: redis / database / memcached.
     */
     'queue' => env('PROCESSHUB_LOG_QUEUE', 'logs'),
     'connection' => env('PROCESSHUB_LOG_CONNECTION', null),
@@ -39,6 +44,8 @@ return [
     'batch_max_bytes' => (int) env('PROCESSHUB_LOG_BATCH_MAX_BYTES', 1800000),
     'timeout_ms' => (int) env('PROCESSHUB_LOG_TIMEOUT_MS', 5000),
     'retry_window_sec' => (int) env('PROCESSHUB_LOG_RETRY_WINDOW_SEC', 3600),
+    'rate_limit_per_minute' => (int) env('PROCESSHUB_RATE_LIMIT_PER_MINUTE', 50),
+    'rate_limit_store' => env('PROCESSHUB_RATE_LIMIT_STORE'),
 
     /*
     |--------------------------------------------------------------------------

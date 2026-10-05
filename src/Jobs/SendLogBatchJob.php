@@ -6,31 +6,36 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 use ProcessHub\Logs\Exceptions\DeliveryFailedException;
 use ProcessHub\Logs\Logging\LogBuffer;
 use ProcessHub\Logs\Support\FallbackFile;
+use ProcessHub\Logs\Support\IngestThrottle;
 use ProcessHub\Logs\Support\LogIngest;
 
 /**
  * Async delivery of a log batch (up to 100 entries) to ProcessHub.
  *
  * Retry policy is time-based, not attempt-based:
- *   - `retryUntil()` gives the batch `processhub.retry_window_sec` (1h by
- *     default) to get through. Attempt counters are irrelevant, so a long
- *     429 streak can't exhaust the job the way `$tries = 3` used to.
- *   - 429 → `release(Retry-After)`; the job simply waits its turn.
- *   - 5xx / network → exception, Laravel retries with `backoff()`;
- *     `$maxExceptions` caps how many real failures we tolerate.
+ *   - the batch has `processhub.retry_window_sec` (1h by default, counted
+ *     from the moment it becomes available) to get through; attempt counters
+ *     are irrelevant, so a long 429 streak can't exhaust the job.
+ *   - before each POST a slot is taken from the shared IngestThrottle; no
+ *     slot → `release()` until there is one.
+ *   - 429 → global pause for Retry-After + `release()`.
+ *   - 5xx / any transport error → DeliveryFailedException, Laravel retries
+ *     with `backoff()`.
  *   - 4xx (except 429) is a config problem (bad token, rejected payload) —
- *     fail immediately, retries won't help.
+ *     retries won't help.
  *
- * Whatever ends up failing (window expired, too many exceptions, timeout,
- * 4xx) lands in the fallback file via `failed()`;
- * `processhub:flush-fallback` re-ingests it later.
+ * Regular dead ends (4xx, next retry wouldn't fit before the deadline) park
+ * the batch in the fallback file and delete the job — nothing piles up in
+ * failed_jobs; `processhub:flush-fallback` re-ingests it later. `failed()`
+ * stays as a safety net for what the job can't intercept (timeouts, a job
+ * picked up after its deadline).
  */
 class SendLogBatchJob implements ShouldQueue
 {
@@ -42,25 +47,35 @@ class SendLogBatchJob implements ShouldQueue
     /** A timed-out attempt goes to `failed()` instead of being retried blindly. */
     public bool $failOnTimeout = true;
 
-    /** 5xx / network failures tolerated within the retry window. */
-    public int $maxExceptions = 10;
-
-    public function __construct(
-        /** @var array<int, array<string, mixed>> */
-        public array $entries,
-    ) {}
+    /**
+     * Unix time until which delivery is retried. Null in jobs serialized by
+     * older package versions — their deadline is the payload's retryUntil.
+     */
+    public ?int $retryDeadline = null;
 
     /**
-     * Push a batch to the configured connection/queue.
+     * @param  array<int, array<string, mixed>>  $entries
+     * @param  int  $delaySeconds  how long the job waits in the queue before
+     *                             its first attempt; shifts the deadline
+     */
+    public function __construct(
+        public array $entries,
+        int $delaySeconds = 0,
+    ) {
+        $this->retryDeadline = now()->getTimestamp() + max(0, $delaySeconds) + self::retryWindow();
+    }
+
+    /**
+     * Push a batch to the configured connection/queue, optionally delayed.
      *
      * @param  array<int, array<string, mixed>>  $entries
      */
-    public static function enqueue(array $entries): void
+    public static function enqueue(array $entries, int $delaySeconds = 0): void
     {
         $queueName = config('processhub.queue');
         $connection = config('processhub.connection');
 
-        $job = new self($entries);
+        $job = new self($entries, $delaySeconds);
         if ($queueName) {
             $job->onQueue($queueName);
         }
@@ -68,12 +83,18 @@ class SendLogBatchJob implements ShouldQueue
             $job->onConnection($connection);
         }
 
-        app(QueueFactory::class)->connection($connection)->pushOn($queueName, $job);
+        $queue = app(QueueFactory::class)->connection($connection);
+        if ($delaySeconds > 0) {
+            $queue->laterOn($queueName, $delaySeconds, $job);
+        } else {
+            $queue->pushOn($queueName, $job);
+        }
     }
 
     /**
-     * True when the throwable describes a failure of log delivery itself —
-     * such reports must not be logged back into the ProcessHub channel.
+     * True when the throwable describes a failure of log delivery itself
+     * (the job's own exception or the worker giving up on it) — such reports
+     * must not be logged back into the ProcessHub channel.
      */
     public static function isOwnFailure(mixed $e): bool
     {
@@ -82,14 +103,21 @@ class SendLogBatchJob implements ShouldQueue
         }
 
         // Covers TimeoutExceededException too (it extends this class).
-        return $e instanceof MaxAttemptsExceededException
-            && isset($e->job)
-            && $e->job->resolveName() === static::class;
+        if (! $e instanceof MaxAttemptsExceededException) {
+            return false;
+        }
+
+        // Early Laravel 10 releases set no `job` on the exception — the message
+        // ("<class> has been attempted too many times…" / "<class> has timed
+        // out.") still names the job.
+        return isset($e->job)
+            ? $e->job->resolveName() === static::class
+            : str_starts_with($e->getMessage(), static::class . ' has ');
     }
 
     public function retryUntil(): \DateTimeInterface
     {
-        return now()->addSeconds(max(60, (int) config('processhub.retry_window_sec', 3600)));
+        return new \DateTimeImmutable('@' . ($this->retryDeadline ?? now()->getTimestamp() + self::retryWindow()));
     }
 
     /**
@@ -114,8 +142,8 @@ class SendLogBatchJob implements ShouldQueue
     }
 
     /**
-     * Final fallback — append entries to a file so a scheduled flush can
-     * retry later when ProcessHub / network recovers.
+     * Last resort for failures the job couldn't intercept (timeout, picked
+     * up after the deadline) — keep entries in the fallback file.
      */
     public function failed(\Throwable $exception): void
     {
@@ -124,10 +152,20 @@ class SendLogBatchJob implements ShouldQueue
 
     private function deliver(string $url, string $token): void
     {
+        $throttle = IngestThrottle::make();
+        $wait = $throttle->acquire();
+        if ($wait > 0) {
+            $this->releaseOrPark($wait, 'Local rate limit');
+
+            return;
+        }
+
         try {
             $response = LogIngest::post($url, $token, $this->entries);
-        } catch (ConnectionException $e) {
-            throw DeliveryFailedException::network($e);
+        } catch (\Throwable $e) {
+            $this->throwOrPark(DeliveryFailedException::network($e));
+
+            return;
         }
 
         if ($response->successful()) {
@@ -137,17 +175,65 @@ class SendLogBatchJob implements ShouldQueue
         $status = $response->status();
 
         if ($status === 429) {
-            $this->release(LogIngest::retryAfter($response));
+            $wait = LogIngest::retryAfter($response);
+            $throttle->pauseFor($wait);
+            $this->releaseOrPark($wait, 'ProcessHub ingest responded HTTP 429');
 
             return;
         }
 
         if ($status >= 400 && $status < 500) {
-            $this->fail(DeliveryFailedException::status($status, $response->body()));
+            $this->park(DeliveryFailedException::status($status, $response->body())->getMessage());
 
             return;
         }
 
-        throw DeliveryFailedException::status($status);
+        $this->throwOrPark(DeliveryFailedException::status($status));
+    }
+
+    private function releaseOrPark(int $delay, string $reason): void
+    {
+        if ($this->fitsBeforeDeadline($delay)) {
+            $this->release($delay);
+        } else {
+            $this->park($reason . '; retry window exhausted');
+        }
+    }
+
+    /**
+     * Throw for a regular backoff retry, unless that retry would come after
+     * the deadline — then the worker would fail the job, so park it now.
+     */
+    private function throwOrPark(DeliveryFailedException $e): void
+    {
+        $backoff = $this->backoff();
+        if ($this->fitsBeforeDeadline($backoff[$this->attempts() - 1] ?? end($backoff))) {
+            throw $e;
+        }
+
+        $this->park($e->getMessage() . '; retry window exhausted');
+    }
+
+    /** The next attempt starts after $delay and still has a full $timeout before the deadline. */
+    private function fitsBeforeDeadline(int $delay): bool
+    {
+        $deadline = $this->retryDeadline ?? $this->job?->retryUntil();
+
+        return $deadline === null || now()->getTimestamp() + $delay + $this->timeout <= (int) $deadline;
+    }
+
+    private function park(string $reason): void
+    {
+        FallbackFile::append($this->entries, $reason);
+        $this->delete();
+        Log::warning('ProcessHub log batch moved to the fallback file', [
+            'reason' => $reason,
+            'entries' => count($this->entries),
+        ]);
+    }
+
+    private static function retryWindow(): int
+    {
+        return max(60, (int) config('processhub.retry_window_sec', 3600));
     }
 }

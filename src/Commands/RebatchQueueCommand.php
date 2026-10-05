@@ -4,17 +4,33 @@ namespace ProcessHub\Logs\Commands;
 
 use Illuminate\Console\Command;
 use Illuminate\Redis\Connections\Connection as RedisConnection;
+use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Support\BatchBuilder;
 
 /**
- * `php artisan processhub:rebatch-queue --from=logs-backlog [--chunk=1000] [--limit=N]`
+ * `php artisan processhub:rebatch-queue --from=logs-backlog [--chunk=1000] [--limit=N] [--rate=N] [--start-delay=S]`
  *
  * Recovery tool for backlogs of one-entry SendLogBatchJob payloads (left by
  * package versions that queued a job per log record). Drains the ready list
  * of the given Redis queue, packs the entries into full batches and pushes
  * them as new SendLogBatchJob onto `processhub.queue`.
+ *
+ * Preparing the backlog (keys carry the `database.redis.options.prefix`):
+ *   RENAMENX <prefix>queues:logs <prefix>queues:logs-backlog
+ *   RENAMENX <prefix>queues:logs:notify <prefix>queues:logs-backlog:notify
+ * RENAMENX never overwrites a backlog left by a previous run. The `:notify`
+ * list holds one item per pushed job; the command deletes
+ * `queues:<from>:notify` once the backlog is fully drained.
+ *
+ * Pacing: new batches are delayed so that `--rate` of them (default
+ * `processhub.rate_limit_per_minute`) become available per minute, evenly
+ * spaced — each one gets its full retry window from the moment it's due and
+ * the whole tail goes out at the ingest rate limit instead of expiring in
+ * the queue. The schedule starts after whatever already sits in the target
+ * queue (ready + delayed + reserved, i.e. earlier runs too), or after
+ * `--start-delay` seconds when given. `--rate=0` disables pacing.
  *
  * Safety: each chunk is moved atomically (Lua: LRANGE + LTRIM + RPUSH) from
  * `queues:<from>` to `queues:<from>:rebatching`, processed, and only then
@@ -31,7 +47,9 @@ class RebatchQueueCommand extends Command
     protected $signature = 'processhub:rebatch-queue
         {--from= : Name of the backlog queue (e.g. logs-backlog)}
         {--chunk=1000 : Jobs claimed from the backlog per step}
-        {--limit= : Max chunks to process in this run}';
+        {--limit= : Max chunks to process in this run}
+        {--rate= : Batches per minute to schedule (default processhub.rate_limit_per_minute, 0 = all at once)}
+        {--start-delay= : Seconds before the first batch is due (default: after the target queue drains at --rate)}';
 
     protected $description = 'Repack single-entry SendLogBatchJob backlog into full batches';
 
@@ -45,6 +63,15 @@ return #items
 LUA;
 
     private const MAX_CHUNK = 5000;
+
+    /** Batches per minute; 0 = no pacing. */
+    private int $rate = 0;
+
+    /** Delay of the first scheduled batch. */
+    private int $startDelay = 0;
+
+    /** Batches scheduled so far in this run. */
+    private int $scheduled = 0;
 
     public function handle(): int
     {
@@ -74,6 +101,8 @@ LUA;
         $claimed = $source . ':rebatching';
         $chunk = max(1, min(self::MAX_CHUNK, (int) $this->option('chunk')));
         $limit = $this->option('limit') !== null ? max(1, (int) $this->option('limit')) : null;
+
+        $this->planSchedule($connectionName, $target);
 
         // Jobs returned to the tail must not be seen twice; bound the run by
         // what was there at start (plus a previously claimed chunk).
@@ -122,8 +151,66 @@ LUA;
             $totals['returned'],
             $from,
         ));
+        if ($this->rate > 0 && $this->scheduled > 0) {
+            $this->info(sprintf(
+                'Paced at %d batches/min: the last batch is due in %d min.',
+                $this->rate,
+                (int) ceil($this->delayFor($this->scheduled - 1) / 60),
+            ));
+        }
+
+        $this->dropNotifyListIfDrained($redis, $source, $claimed);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * By default the new batches queue up behind what the target already
+     * holds (ready + delayed + reserved "slots" at the same rate), so
+     * consecutive runs and steps don't overlap.
+     */
+    private function planSchedule(string $connectionName, string $target): void
+    {
+        $this->scheduled = 0;
+        $this->startDelay = 0;
+        $rate = $this->option('rate');
+        $this->rate = max(0, $rate !== null ? (int) $rate : (int) config('processhub.rate_limit_per_minute', 50));
+        if ($this->rate === 0) {
+            return;
+        }
+
+        $startDelay = $this->option('start-delay');
+        $this->startDelay = $startDelay !== null
+            ? max(0, (int) $startDelay)
+            : intdiv(Queue::connection($connectionName)->size($target) * 60, $this->rate);
+    }
+
+    /** Seconds until the n-th (0-based) batch of this run is due. */
+    private function delayFor(int $n): int
+    {
+        return $this->rate > 0 ? $this->startDelay + intdiv($n * 60, $this->rate) : 0;
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $batch
+     */
+    private function schedule(array $batch): void
+    {
+        SendLogBatchJob::enqueue($batch, $this->delayFor($this->scheduled++));
+    }
+
+    /**
+     * Each pushed job left an item in `queues:<from>:notify`; once the backlog
+     * is gone they are just dead weight.
+     */
+    private function dropNotifyListIfDrained(RedisConnection $redis, string $source, string $claimed): void
+    {
+        $left = (int) $redis->llen($source) + (int) $redis->llen($claimed)
+            + (int) $redis->zcard($source . ':delayed') + (int) $redis->zcard($source . ':reserved');
+
+        if ($left === 0 && (int) $redis->del($source . ':notify') > 0) {
+            $this->line("Removed {$source}:notify.");
+        }
     }
 
     /**
@@ -145,7 +232,7 @@ LUA;
             foreach ($entries as $entry) {
                 $stats['entries']++;
                 foreach ($batcher->add($entry) as $batch) {
-                    SendLogBatchJob::enqueue($batch);
+                    $this->schedule($batch);
                     $stats['batches']++;
                 }
             }
@@ -153,7 +240,7 @@ LUA;
 
         $rest = $batcher->drain();
         if ($rest !== []) {
-            SendLogBatchJob::enqueue($rest);
+            $this->schedule($rest);
             $stats['batches']++;
         }
 
