@@ -3,17 +3,26 @@
 namespace ProcessHub\Logs\Tests\Feature;
 
 use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Queue\Factory as QueueFactory;
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Contracts\Queue\Queue;
+use Illuminate\Foundation\Exceptions\Handler;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Queue\MaxAttemptsExceededException;
+use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Facade;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Queue as QueueFacade;
 use Mockery;
@@ -157,6 +166,28 @@ class LogBatchingTest extends TestCase
         $this->assertSame(2, app(LogBuffer::class)->pending());
     }
 
+    public function test_mute_ends_with_the_attempt_and_the_reported_exception_is_dropped(): void
+    {
+        if (! class_exists(JobAttempted::class)) {
+            $this->markTestSkipped('JobAttempted appeared in Laravel 11.');
+        }
+        QueueFacade::fake();
+        config()->set('logging.default', 'processhub');
+        $deliveryJob = $this->queueJob(SendLogBatchJob::class);
+        $e = new \RuntimeException('cache store is down');
+
+        // Worker::process() → runJob(): the exception is reported after JobAttempted.
+        event(new JobProcessing('redis', $deliveryJob));
+        event(new JobExceptionOccurred('redis', $deliveryJob, $e));
+        event(new JobAttempted('redis', $deliveryJob, true));
+        $this->assertFalse(app(LogBuffer::class)->isMuted());
+        report($e);
+        $this->assertSame(0, app(LogBuffer::class)->pending());
+
+        Log::channel('processhub')->error('next');
+        $this->assertSame(1, app(LogBuffer::class)->pending());
+    }
+
     public function test_sync_delivery_job_does_not_leave_buffer_muted(): void
     {
         config()->set('queue.default', 'sync');
@@ -195,6 +226,44 @@ class LogBatchingTest extends TestCase
         $this->assertSame(3, app(LogBuffer::class)->pending());
     }
 
+    public function test_sync_delivery_failure_is_parked_once(): void
+    {
+        config()->set('processhub.connection', 'sync');
+        Http::fake(fn () => throw new ConnectionException('down'));
+
+        Log::channel('processhub')->warning('one');
+        app(LogBuffer::class)->flush();
+
+        $lines = file(config('processhub.fallback_path'), FILE_IGNORE_NEW_LINES);
+        $this->assertCount(1, $lines);
+        $this->assertSame(['one'], array_column(json_decode($lines[0], true)['entries'], 'message'));
+    }
+
+    /**
+     * Sentry's Integration::handles() is registered by withExceptions() in
+     * bootstrap/app.php — an afterResolving callback of the handler. Our
+     * callback must run before it on every Laravel version.
+     */
+    public function test_own_failures_never_reach_callbacks_registered_by_the_app(): void
+    {
+        $reported = [];
+        $this->app->forgetInstance(ExceptionHandler::class);
+        $this->app->afterResolving(Handler::class, function (Handler $handler) use (&$reported): void {
+            $handler->reportable(function (\Throwable $e) use (&$reported): void {
+                $reported[] = $e->getMessage();
+            });
+        });
+
+        $deliveryJob = $this->queueJob(SendLogBatchJob::class);
+        report(MaxAttemptsExceededException::forJob($deliveryJob));
+        report(TimeoutExceededException::forJob($deliveryJob));
+        report(DeliveryFailedException::status(503));
+        $this->assertSame([], $reported);
+
+        report(MaxAttemptsExceededException::forJob($this->queueJob('App\\Jobs\\SendReceipt')));
+        $this->assertCount(1, $reported);
+    }
+
     public function test_delivery_failures_are_not_reported_on_every_attempt(): void
     {
         $handler = app(ExceptionHandler::class);
@@ -217,6 +286,53 @@ class LogBatchingTest extends TestCase
         event(new CommandFinished('some:command', new ArrayInput([]), new NullOutput(), 0));
 
         $this->assertSame([3], $this->pushedSizes());
+    }
+
+    public function test_long_running_commands_without_flush_point_ship_right_away(): void
+    {
+        QueueFacade::fake();
+
+        event(new CommandStarting('inspire', new ArrayInput([]), new NullOutput()));
+        $this->logMany(1);
+        $this->assertSame(1, app(LogBuffer::class)->pending());
+
+        event(new CommandStarting('horizon', new ArrayInput([]), new NullOutput()));
+        $this->assertSame([1], $this->pushedSizes());
+        $this->logMany(1);
+        $this->assertSame([1, 1], $this->pushedSizes());
+        $this->assertSame(0, app(LogBuffer::class)->pending());
+    }
+
+    public function test_configured_long_running_command_ships_right_away(): void
+    {
+        QueueFacade::fake();
+        config()->set('processhub.unbuffered_commands', ['bot:poll']);
+
+        event(new CommandStarting('bot:poll', new ArrayInput([]), new NullOutput()));
+        $this->logMany(1);
+
+        $this->assertSame([1], $this->pushedSizes());
+    }
+
+    /**
+     * Test suites flush the application without terminating it; whatever
+     * it buffered must not be pushed into the next application.
+     */
+    public function test_entries_of_a_flushed_application_are_dropped(): void
+    {
+        $other = $this->createApplication();
+        Container::setInstance($this->app);
+        Facade::clearResolvedInstances();
+        Facade::setFacadeApplication($this->app);
+        $buffer = $other->make(LogBuffer::class);
+        $buffer->push(['level' => 'WARN', 'message' => 'orphan']);
+        $other->flush();
+
+        QueueFacade::fake();
+        $buffer->flushOnShutdown();
+
+        QueueFacade::assertNothingPushed();
+        $this->assertFileDoesNotExist(config('processhub.fallback_path'));
     }
 
     public function test_handler_close_flushes(): void

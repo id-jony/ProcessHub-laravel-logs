@@ -3,10 +3,13 @@
 namespace ProcessHub\Logs;
 
 use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Debug\ExceptionHandler;
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Http\Kernel;
-use Illuminate\Foundation\Bootstrap\HandleExceptions;
+use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -31,9 +34,6 @@ use ProcessHub\Logs\Middleware\CorrelateRequestId;
 
 class ProcessHubServiceProvider extends ServiceProvider
 {
-    /** Bytes kept free for Laravel's fatal-error handling (see registerShutdownFlush()). */
-    private const SHUTDOWN_MEMORY_RESERVE = 128 * 1024;
-
     public function register(): void
     {
         // Capture boot time once so heartbeats can report real uptime.
@@ -51,6 +51,10 @@ class ProcessHubServiceProvider extends ServiceProvider
 
         // Per-process buffer of log entries awaiting a SendLogBatchJob.
         $this->app->singleton(LogBuffer::class);
+
+        // Auto-capture uncaught exceptions through the Handler's reportable()
+        // hook — the user doesn't need to wrap them into Log::error() calls.
+        $this->registerExceptionHooks();
     }
 
     public function boot(): void
@@ -106,20 +110,6 @@ class ProcessHubServiceProvider extends ServiceProvider
 
         // 5a. Flush buffered log entries at every unit-of-work boundary.
         $this->registerBufferFlushHooks();
-
-        // 6. Auto-capture uncaught exceptions through the Handler's
-        //    reportable() hook — the user doesn't need to manually wrap
-        //    exceptions into Log::error() calls.
-        $this->app->booted(function () {
-            try {
-                $handler = $this->app->make(ExceptionHandler::class);
-                $this->silenceOwnFailures($handler);
-                HandleExceptionReported::register($handler);
-            } catch (\Throwable) {
-                // Non-standard Handler (Laravel 11+ bootstrap-style) — the
-                // user must wire Log::error manually. Don't crash boot.
-            }
-        });
     }
 
     /**
@@ -152,57 +142,113 @@ class ProcessHubServiceProvider extends ServiceProvider
             Looping::class,
         ], static fn () => $buffer->flushIfStale());
 
-        // Everything logged while a worker processes a SendLogBatchJob —
-        // including the worker reporting its exception, which happens after
-        // JobFailed / JobReleasedAfterException — must not produce another
-        // batch. A sync job runs inline (no worker loop to unmute after it)
-        // and mutes itself in handle().
+        // Daemons without a worker loop (Horizon master, schedule:work, …)
+        // have nothing that would ship an entry before the next one or exit.
+        $events->listen(CommandStarting::class, static function (CommandStarting $event) use ($buffer): void {
+            if (in_array($event->command, self::unbufferedCommands(), true)) {
+                $buffer->setBuffered(false);
+            }
+        });
+
+        $this->registerDeliveryJobMute($buffer, $events);
+        $this->registerShutdownFlush($buffer);
+    }
+
+    /**
+     * Everything logged while a worker processes a SendLogBatchJob must not
+     * produce another batch. The worker reports the job's exception after
+     * the attempt (JobAttempted, Laravel 11+) — that exception is remembered
+     * from JobExceptionOccurred. Laravel 10 has no JobAttempted: the mute
+     * lasts until the next loop tick / job / worker stop. A sync job runs
+     * inline (no worker loop to unmute after it) and mutes itself in handle().
+     */
+    protected function registerDeliveryJobMute(LogBuffer $buffer, Dispatcher $events): void
+    {
         $events->listen(JobProcessing::class, static function (JobProcessing $event) use ($buffer): void {
             $buffer->setInDeliveryJob(
                 ! $event->job instanceof SyncJob
                 && $event->job->resolveName() === SendLogBatchJob::class,
             );
         });
+        $events->listen(JobExceptionOccurred::class, static function (JobExceptionOccurred $event) use ($buffer): void {
+            if ($event->job->resolveName() === SendLogBatchJob::class) {
+                $buffer->markDeliveryException($event->exception);
+            }
+        });
         $events->listen([
+            JobAttempted::class,
             Looping::class,
             WorkerStopping::class,
             CommandFinished::class,
         ], static fn () => $buffer->setInDeliveryJob(false));
-
-        $this->registerShutdownFlush($buffer);
     }
 
     /**
      * Fatal errors (OOM, max_execution_time) skip terminating callbacks and
      * destructors; a shutdown function is the only place left to flush.
      * Laravel's HandleExceptions logs the FatalError from its own shutdown
-     * function, so ours re-registers itself from inside the shutdown phase —
-     * that puts it after every function registered during the request.
+     * function (HandleExceptionReported reclaims memory at the start of
+     * that report), so ours re-registers itself from inside the shutdown
+     * phase — that puts it after every function registered during the
+     * request. If Laravel didn't log the FatalError, it is shipped here.
      */
     protected function registerShutdownFlush(LogBuffer $buffer): void
     {
-        // Laravel's shutdown handler starts by freeing this reserve; its 32 KB
-        // aren't always enough on OOM even to build the FatalError, and then
-        // no shutdown function after it runs. LogBuffer raises memory_limit
-        // as soon as the FatalError reaches it.
-        if (is_string(HandleExceptions::$reservedMemory)
-            && strlen(HandleExceptions::$reservedMemory) < self::SHUTDOWN_MEMORY_RESERVE
-        ) {
-            HandleExceptions::$reservedMemory = str_repeat('x', self::SHUTDOWN_MEMORY_RESERVE);
-        }
-
         // Weak: in test suites each booted app would otherwise stay in memory.
         $ref = \WeakReference::create($buffer);
 
         register_shutdown_function(static function () use ($ref): void {
-            register_shutdown_function(static fn () => $ref->get()?->flushOnShutdown());
+            register_shutdown_function(static function () use ($ref): void {
+                $buffer = $ref->get();
+                if ($buffer === null || ! $buffer->isOwnerAlive()) {
+                    return;
+                }
+                $buffer->flushOnShutdown();
+                HandleExceptionReported::reportMissedFatalError($buffer);
+            });
+        });
+    }
+
+    /**
+     * Hooks into the exception handler while it is being resolved: the
+     * container runs `resolving` callbacks before `afterResolving` ones, and
+     * `withExceptions()` in bootstrap/app.php (where Sentry is wired) is an
+     * afterResolving callback — so our reportable callback comes first.
+     */
+    protected function registerExceptionHooks(): void
+    {
+        $register = function (ExceptionHandler $handler): void {
+            try {
+                $this->silenceOwnFailures($handler);
+                HandleExceptionReported::register($handler);
+            } catch (\Throwable) {
+                // Non-standard Handler — the user must wire Log::error
+                // manually. Don't crash boot.
+            }
+        };
+
+        if ($this->app->resolved(ExceptionHandler::class)) {
+            $register($this->app->make(ExceptionHandler::class));
+        }
+        $this->app->resolving(ExceptionHandler::class, $register);
+
+        // Resolved (and its class loaded) now, not on a fatal error: on OOM
+        // the shutdown handler has no memory to compile it.
+        $this->app->booted(function (): void {
+            try {
+                $this->app->make(ExceptionHandler::class);
+            } catch (\Throwable) {
+                // No handler bound — nothing to hook into.
+            }
         });
     }
 
     /**
      * DeliveryFailedException (and other failures of SendLogBatchJob itself)
      * would otherwise hit Sentry/daily on every retry attempt. Batches that
-     * finally fail land in the fallback file.
+     * finally fail land in the fallback file. HandleExceptionReported stops
+     * them on every Laravel version; dontReportWhen() (Laravel 12+) also
+     * makes shouldReport() say so.
      */
     protected function silenceOwnFailures(ExceptionHandler $handler): void
     {
@@ -211,6 +257,27 @@ class ProcessHubServiceProvider extends ServiceProvider
         } elseif (method_exists($handler, 'ignore')) {
             $handler->ignore(DeliveryFailedException::class);
         }
+    }
+
+    /**
+     * Long-running commands that never reach a flush point: entries are
+     * queued right away there. Queue workers are not listed — their loop
+     * flushes by age on every tick.
+     *
+     * @return array<int, string>
+     */
+    protected static function unbufferedCommands(): array
+    {
+        return array_merge([
+            'horizon',
+            'horizon:supervisor',
+            'schedule:work',
+            'queue:listen',
+            'reverb:start',
+            'pulse:check',
+            'pulse:work',
+            'octane:start',
+        ], (array) config('processhub.unbuffered_commands', []));
     }
 
     protected function registerEventListeners(): void

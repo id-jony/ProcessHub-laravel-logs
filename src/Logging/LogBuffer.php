@@ -2,10 +2,13 @@
 
 namespace ProcessHub\Logs\Logging;
 
+use Illuminate\Cache\RateLimiting\Unlimited;
+use Illuminate\Contracts\Container\Container;
 use Illuminate\Support\Carbon;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Support\BatchBuilder;
 use ProcessHub\Logs\Support\FallbackFile;
+use Symfony\Component\ErrorHandler\Error\FatalError;
 
 /**
  * In-memory buffer between ProcessHubHandler and the queue: one
@@ -18,7 +21,9 @@ use ProcessHub\Logs\Support\FallbackFile;
  *     tick (flushIfStale()), so a worker running thousands of one-log jobs
  *     still ships full batches;
  *   - the unit of work ends (end of HTTP request, console command, worker
- *     stop, PHP shutdown — including fatal errors): flush().
+ *     stop, PHP shutdown — including fatal errors): flush();
+ *   - right away in long-running processes with no point to flush at
+ *     (setBuffered(false)).
  *
  * Recursion guard: while a batch is being pushed or a SendLogBatchJob is
  * being processed the buffer is muted — records produced by the delivery
@@ -26,11 +31,23 @@ use ProcessHub\Logs\Support\FallbackFile;
  * job's exception) are dropped instead of feeding back into the channel. If
  * the push fails, the batch goes to the fallback file; the application never
  * sees the exception.
+ *
+ * Entries belong to the application that created the buffer: once it has
+ * been flushed (end of a test) they are dropped instead of being pushed
+ * into whatever container is current.
  */
 class LogBuffer
 {
     /** Memory allowed past an exhausted memory_limit to ship the buffer. */
     private const SHUTDOWN_EXTRA_MEMORY = 16 * 1024 * 1024;
+
+    /**
+     * Freed first thing when a fatal error is handled: room to ship the
+     * buffer when memory_limit can't be raised (php_admin_value).
+     */
+    private const RESERVED_MEMORY = 256 * 1024;
+
+    private static ?string $reservedMemory = null;
 
     private ?BatchBuilder $batch = null;
 
@@ -43,16 +60,25 @@ class LogBuffer
 
     private bool $inDeliveryJob = false;
 
+    private bool $buffered = true;
+
+    private bool $fatalErrorQueued = false;
+
     /** Process that owns the buffered entries (see claimForCurrentProcess()). */
     private int $pid;
 
-    /** @var \WeakMap<\Throwable, true> */
-    private \WeakMap $shippedExceptions;
+    /** @var \WeakMap<\Throwable, true> exceptions thrown by SendLogBatchJob runs */
+    private \WeakMap $deliveryExceptions;
 
-    public function __construct()
+    /** @var \WeakReference<Container>|null */
+    private ?\WeakReference $app;
+
+    public function __construct(?Container $app = null)
     {
         $this->pid = (int) getmypid();
-        $this->shippedExceptions = new \WeakMap();
+        $this->deliveryExceptions = new \WeakMap();
+        $this->app = $app !== null ? \WeakReference::create($app) : null;
+        self::prepareForFatalError();
     }
 
     /**
@@ -79,7 +105,11 @@ class LogBuffer
             $this->dispatch($entries);
         }
 
-        $this->flushIfStale();
+        if ($this->buffered) {
+            $this->flushIfStale();
+        } else {
+            $this->flush();
+        }
     }
 
     public function flush(): void
@@ -123,19 +153,27 @@ class LogBuffer
     public function flushOnShutdown(): void
     {
         try {
-            $error = error_get_last();
-            if ($error !== null
-                && preg_match('/^Allowed memory size of (\d+) bytes exhausted/', $error['message'], $m) === 1
-            ) {
-                // Сам flush (сериализация пачки, push в очередь) требует памяти,
-                // а её не осталось — даём немного сверх лимита, как Sentry.
-                ini_set('memory_limit', (string) ((int) $m[1] + self::SHUTDOWN_EXTRA_MEMORY));
-            }
-
+            self::reclaimMemory();
             $this->flush();
         } catch (\Throwable) {
             // Nothing sensible left to do at shutdown.
         }
+    }
+
+    /**
+     * A FatalError entry has just been buffered: ship it at once — rendering
+     * the error after it is reported may die again and skip every later
+     * shutdown function.
+     */
+    public function flushFatalError(): void
+    {
+        $this->fatalErrorQueued = true;
+        $this->flushOnShutdown();
+    }
+
+    public function hasFatalError(): bool
+    {
+        return $this->fatalErrorQueued;
     }
 
     /**
@@ -157,10 +195,10 @@ class LogBuffer
     }
 
     /**
-     * Mute the buffer while the worker processes a SendLogBatchJob. Kept on
-     * until the worker moves on (next job / loop tick / stop): the worker
-     * reports a job's exception only after JobFailed and
-     * JobReleasedAfterException have been dispatched.
+     * Mute the buffer while the worker processes a SendLogBatchJob — until
+     * the attempt is over (JobAttempted) or, on Laravel 10, until the worker
+     * moves on (loop tick / stop). The exception the worker reports after
+     * that is recognised by isDeliveryFailure().
      */
     public function setInDeliveryJob(bool $inDeliveryJob): void
     {
@@ -173,18 +211,34 @@ class LogBuffer
     }
 
     /**
-     * True the first time a given exception object is offered — the same
-     * exception reaches the channel twice when processhub is in the default
-     * log stack (Laravel's own report log + HandleExceptionReported).
+     * False: every entry is queued right away. For long-running processes
+     * that never reach a flush point (no worker loop, no end of command).
      */
-    public function claimException(\Throwable $e): bool
+    public function setBuffered(bool $buffered): void
     {
-        if (isset($this->shippedExceptions[$e])) {
-            return false;
+        $this->buffered = $buffered;
+        if (! $buffered) {
+            $this->flush();
         }
-        $this->shippedExceptions[$e] = true;
+    }
 
-        return true;
+    /**
+     * Remember an exception thrown out of a SendLogBatchJob run (from
+     * JobExceptionOccurred) — the worker reports it afterwards.
+     */
+    public function markDeliveryException(\Throwable $e): void
+    {
+        $this->deliveryExceptions[$e] = true;
+    }
+
+    /**
+     * True for failures of log delivery itself — reporting them into the
+     * ProcessHub channel would create a new batch per failed one.
+     */
+    public function isDeliveryFailure(mixed $e): bool
+    {
+        return SendLogBatchJob::isOwnFailure($e)
+            || ($e instanceof \Throwable && isset($this->deliveryExceptions[$e]));
     }
 
     public function pending(): int
@@ -193,17 +247,77 @@ class LogBuffer
     }
 
     /**
+     * False once the application this buffer belongs to has been flushed.
+     */
+    public function isOwnerAlive(): bool
+    {
+        if ($this->app === null) {
+            return true;
+        }
+
+        return $this->app->get()?->bound(self::class) ?? false;
+    }
+
+    /**
      * @param  array<int, array<string, mixed>>  $entries
      */
     private function dispatch(array $entries): void
     {
+        if (! $this->isOwnerAlive()) {
+            return;
+        }
+
         $this->flushing = true;
         try {
             SendLogBatchJob::enqueue($entries);
         } catch (\Throwable $e) {
-            FallbackFile::append($entries, 'Queue push failed: ' . $e->getMessage());
+            // A sync connection runs the job inline and rethrows its failure
+            // after failed() has already parked the batch.
+            if (! $this->isDeliveryFailure($e)) {
+                FallbackFile::append($entries, 'Queue push failed: ' . $e->getMessage());
+            }
         } finally {
             $this->flushing = false;
+        }
+    }
+
+    /**
+     * Laravel builds a FatalError and runs its throttle check before our
+     * reportable callback gets memory back; on OOM there is no memory left
+     * to compile those classes, so they are loaded upfront.
+     */
+    private static function prepareForFatalError(): void
+    {
+        if (self::$reservedMemory !== null) {
+            return;
+        }
+
+        self::$reservedMemory = str_repeat("\0", self::RESERVED_MEMORY);
+        class_exists(FatalError::class);
+        class_exists(Unlimited::class);
+    }
+
+    /**
+     * Sentry's approach: drop our reserve and, on "Allowed memory size …
+     * exhausted", raise memory_limit so the buffer can still be shipped.
+     */
+    private static function reclaimMemory(): void
+    {
+        self::$reservedMemory = null;
+
+        $error = error_get_last();
+        if ($error === null
+            || preg_match('/^Allowed memory size of (\d+) bytes exhausted/', $error['message'], $m) !== 1
+        ) {
+            return;
+        }
+
+        $limit = (int) $m[1] + self::SHUTDOWN_EXTRA_MEMORY;
+        // Лимит ниже текущего потребления ini_set не примет, а его warning
+        // обработчик Laravel превратит в исключение; php_admin_value не
+        // поднять вовсе — тогда остаётся только освобождённый резерв.
+        if ($limit > memory_get_usage(true)) {
+            @ini_set('memory_limit', (string) $limit);
         }
     }
 

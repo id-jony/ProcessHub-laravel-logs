@@ -5,7 +5,6 @@ namespace ProcessHub\Logs\Logging;
 use Monolog\Handler\AbstractProcessingHandler;
 use Monolog\Level;
 use Monolog\LogRecord;
-use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Redaction\Redactor;
 use Symfony\Component\ErrorHandler\Error\FatalError;
 
@@ -72,7 +71,7 @@ class ProcessHubHandler extends AbstractProcessingHandler
         // SendLogBatchJob) or reporting its failures would feed back into
         // this very channel — drop them.
         if ($this->buffer->isMuted()
-            || SendLogBatchJob::isOwnFailure($record->context['exception'] ?? null)
+            || $this->buffer->isDeliveryFailure($record->context['exception'] ?? null)
         ) {
             return;
         }
@@ -109,21 +108,10 @@ class ProcessHubHandler extends AbstractProcessingHandler
             }
         }
 
-        // One entry per exception object: with processhub in the default
-        // stack Laravel logs a reported exception itself and
-        // HandleExceptionReported does it again.
-        $exception = $record->context['exception'] ?? null;
-        if ($exception instanceof \Throwable && ! $this->buffer->claimException($exception)) {
-            return;
-        }
-
         $this->buffer->push($this->buildEntry($record));
 
-        // Laravel reports a fatal error from its shutdown function and then
-        // renders it — under OOM that rendering may die again and skip every
-        // later shutdown function, ours included. Ship right away.
-        if ($exception instanceof FatalError) {
-            $this->buffer->flushOnShutdown();
+        if (($record->context['exception'] ?? null) instanceof FatalError) {
+            $this->buffer->flushFatalError();
         }
     }
 
