@@ -25,6 +25,19 @@ class FallbackFileTest extends TestCase
         $this->assertSame('next', json_decode($lines[1], true)['entries'][0]['message']);
     }
 
+    public function test_store_reports_whether_the_line_was_written(): void
+    {
+        $path = config('processhub.fallback_path');
+        $this->assertTrue(FallbackFile::store([['level' => 'ERROR', 'message' => 'kept']], 'x'));
+        $this->assertStringContainsString('"kept"', (string) file_get_contents($path));
+
+        config()->set('processhub.fallback_path', sys_get_temp_dir() . '/processhub-missing-dir-' . uniqid() . '/fallback.log');
+        $this->assertFalse(FallbackFile::store([['level' => 'ERROR', 'message' => 'lost']], 'x'));
+        // append() по-прежнему молча проглатывает ошибку.
+        FallbackFile::append([['level' => 'ERROR', 'message' => 'lost']], 'x');
+        config()->set('processhub.fallback_path', $path);
+    }
+
     public function test_locked_excludes_other_holders_of_the_write_lock(): void
     {
         $path = config('processhub.fallback_path');

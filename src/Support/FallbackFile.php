@@ -28,15 +28,27 @@ final class FallbackFile
         }
 
         try {
-            $path = config('processhub.fallback_path');
-            if (! $path) {
-                return;
-            }
-            $line = self::line($entries, $reason);
-            self::locked($path, static fn () => self::write($path, $line));
+            self::store($entries, $reason);
         } catch (\Throwable) {
             // Nowhere left to report to.
         }
+    }
+
+    /**
+     * Same as `append()`, but tells whether the line was written — for
+     * callers that delete the entries' only other copy afterwards.
+     *
+     * @param  array<int, array<string, mixed>>  $entries
+     */
+    public static function store(array $entries, string $reason): bool
+    {
+        $path = config('processhub.fallback_path');
+        if ($entries === [] || ! $path) {
+            return $entries === [];
+        }
+        $line = self::line($entries, $reason);
+
+        return self::locked($path, static fn (): bool => self::write($path, $line));
     }
 
     /**
@@ -80,11 +92,11 @@ final class FallbackFile
         }
     }
 
-    private static function write(string $path, string $line): void
+    private static function write(string $path, string $line): bool
     {
         $fh = @fopen($path, 'a+');
         if ($fh === false) {
-            return;
+            return false;
         }
 
         try {
@@ -95,8 +107,9 @@ final class FallbackFile
             if ($size > 0 && fseek($fh, -1, SEEK_END) === 0 && fread($fh, 1) !== "\n") {
                 $line = "\n" . $line;
             }
-            fwrite($fh, $line);
-            fflush($fh);
+            $written = fwrite($fh, $line) === strlen($line);
+
+            return fflush($fh) && $written;
         } finally {
             flock($fh, LOCK_UN);
             fclose($fh);
