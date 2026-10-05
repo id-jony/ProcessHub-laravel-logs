@@ -15,10 +15,14 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 
 ### Fixed
 
-- **Remote config timeouts are applied** — `httpTimeoutSeconds` from the
+- **Remote config is applied safely** — `httpTimeoutSeconds` from the
   remote config used to be written to an unused key; it now sets
   `timeout_ms` (clamped to 1–20 s, below the job's 30 s timeout), and
-  `flushIntervalSeconds` sets `flush_interval_sec` (0–60 s).
+  `flushIntervalSeconds` sets `flush_interval_sec` (1–60 s). `batchSize` that
+  is `0`, negative, `null` or not a number is ignored and anything below 10
+  is raised to 10, so a typo can't bring back one job per log line.
+  `minLevel` accepts ProcessHub's own `WARN` (any case); `enabled` is read
+  as a boolean (`"false"`, `0`, `"off"` turn shipping off).
   `processhub:config:show` shows the correct `listeners.mail` default and the
   new keys. A batch dropped because the fallback file is disabled is logged as
   dropped, not as moved.
@@ -38,31 +42,29 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   `processhub.unbuffered_commands`) queue every entry right away instead of
   holding it until the next record.
 - **Fatal errors** (OOM, `max_execution_time`) deliver both the buffer and the
-  `FatalError`. The package keeps its own 256 KB memory reserve and preloads
-  the classes Laravel needs to build the `FatalError`; its reportable
-  callback frees the reserve, raises `memory_limit` by 16 MB like Sentry
+  `FatalError`. The package preloads the classes Laravel needs to build the
+  `FatalError`; its reportable callback raises `memory_limit` by 16 MB like
+  Sentry
   (only above current usage, `@ini_set`) and ships the buffer before
   Sentry/daily/rendering run. `HandleExceptions::$reservedMemory` is not
   touched. A `FatalError` Laravel didn't log (dontReport, throttling, failing
   logger) is shipped from `error_get_last()` — once.
 - **No feedback loops** — the buffer is muted while a worker processes a
-  `SendLogBatchJob`, until the attempt is over (`JobAttempted`, Laravel 11+;
-  on Laravel 10 until the next job / loop tick / worker stop); the exception
-  the worker then reports is recognised and dropped. `HandleJobFailed`
-  ignores failures of `SendLogBatchJob`; the handler drops reports of its own
-  delivery failures. A throwing queue push no longer reaches the app — the
-  batch goes to the fallback file, once (on the `sync` connection the failed
-  inline delivery has already parked it). `queue:work --once` in tests no
-  longer leaves the channel muted.
+  `SendLogBatchJob`, until the worker moves on (next loop tick / job / worker
+  stop / end of the command), so the worker's report of an exception that
+  escaped the job is dropped too. `HandleJobFailed` ignores failures of
+  `SendLogBatchJob`; the handler drops reports of its own delivery failures.
+  A throwing queue push no longer reaches the app — the batch goes to the
+  fallback file.
 - **No Sentry/daily spam on Laravel 10–12** — the package's reportable
   callback is registered while the exception handler is being resolved
   (before `withExceptions()` callbacks such as Sentry's
   `Integration::handles()`) and returns `false` for
-  `SendLogBatchJob::isOwnFailure()` (`DeliveryFailedException`,
-  `MaxAttemptsExceeded`/`TimeoutExceeded` of the job). `dontReportWhen()`
-  (Laravel 12) / `ignore(DeliveryFailedException)` (Laravel 11 and older)
-  stay. A classic `app/Exceptions/Handler.php` needs the same `reportable()`
-  line before Sentry's (see README).
+  `SendLogBatchJob::isOwnFailure()` (`MaxAttemptsExceeded`/`TimeoutExceeded`
+  of the job, `DeliveryFailedException`). A classic `app/Exceptions/Handler.php`, or an app where something
+  resolves the handler earlier (e.g. `nunomaduro/collision` installed with
+  dev dependencies), needs the same `reportable()` line before Sentry's (see
+  README).
 - **Exception context kept** — with `processhub` in the default channel or
   stack, Laravel's own report log (with the exception's `context()` and
   `userId`) is the shipped entry; the auto-capture hook logs only when the
@@ -72,21 +74,29 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   a deadline of `retry_window_sec` (1h) from the moment the batch is due,
   checked by the job itself (a job picked up late is parked, not failed);
   the worker's `retryUntil()` is the deadline + 24 h, no
-  `$tries`/`$maxExceptions`. Jobs queued by 0.3 (`$tries = 3`) are retried as
-  new jobs. `Retry-After` (whole seconds or IMF-fixdate, clamped to 1–600 s,
-  30 s otherwise) on 429, `backoff()` 10/30/120/300 s on 5xx / network,
-  `$failOnTimeout = true`.
-- **Every transport error is a delivery failure** — connect, reset, TLS,
-  HTTP/2 (e.g. cURL 55/56/60/92 that Laravel < 12 passed through unwrapped)
-  → `DeliveryFailedException` and a regular retry.
+  `$tries`/`$maxExceptions`. `Retry-After` (whole seconds or IMF-fixdate,
+  clamped to 1–600 s, 30 s otherwise) on 429, `backoff()` 10/30/120/300 s on
+  5xx / 408 / network, `$failOnTimeout = true`.
+- **Expected delivery failures are released, not thrown** — any error of the
+  HTTP call (connect, reset, TLS, HTTP/2 — e.g. cURL 55/56/60/92 that
+  Laravel < 12 passed through unwrapped — or anything else the client
+  throws), 5xx and 408 end the attempt with `release(backoff)`, like 429.
+  The worker no longer reports them and no longer quits on "Connection reset
+  by peer" as if it had lost the queue connection.
+- **Jobs queued by 0.3** (no deadline) are sent only if the limiter lets them
+  through right away — they never take a turn in its line, so a backlog of
+  them can't push fresh batches past their deadline — and are never retried:
+  anything else parks the batch in the fallback file.
 - **Bad values don't sink a batch** — `INF`/`NaN` and broken UTF-8 are
   substituted when encoding; broken UTF-8 no longer makes a batch
   unqueueable.
 - **Dead ends go to the fallback file, not `failed_jobs`** — 4xx (except
-  429), a job picked up after its deadline or a retry that wouldn't fit
-  before it appends the batch to the fallback file and deletes the job.
-  `failed()` stays for timeouts; a batch the fallback file can't take stays
-  in `failed_jobs`.
+  408/429), a job picked up after its deadline, a retry that wouldn't fit
+  before it, or the `sync` connection (it can't delay a retry) appends the
+  batch to the fallback file and deletes the job. `failed()` stays for
+  timeouts; a batch the fallback file can't take is failed before anything
+  is logged and stays only in `failed_jobs` (`failed()` doesn't append it
+  after all).
 - **Exceptions in context reach ProcessHub again** — `ProcessHubHandler`
   extracts the `Throwable` before `Redactor` runs (it used to turn the
   exception object into `[]`, so class/message/stack trace were lost).
@@ -105,9 +115,10 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   messages without splitting the batch; otherwise the batch is split in
   halves until the refused entries are isolated (`cat <path>.rejected >>
   <path>` to retry). Unparseable lines go to `.rejected` as `raw`.
-  401/403/404/405 or 5 temporary failures in a row (backoff 2–16 s) stop the
-  run with exit code 1, nothing skipped. A `<path>.flushing.tmp` left by an
-  earlier build is picked up automatically.
+  401/403/404/405 or 5 temporary failures in a row (5xx, 408, network;
+  backoff 2–16 s) stop the run with exit code 1, nothing skipped. The
+  checkpoint is written before the first request: if it can't be, the run
+  stops without sending (instead of resending the first batch every run).
 
 ### Added
 
@@ -115,13 +126,15 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
   `processhub:flush-fallback` (GCRA, burst ⌈limit/10⌉: ≤ limit + burst in
   any 60 s) in one cache key under `Cache::lock`; refused senders get
   successive turns (FIFO, ~2 attempts per queued job); a 429 pauses every
-  sender. A store without atomic locks makes it step aside with a warning.
+  sender. A busy lock is retried every 20 ms (Laravel's default is 250 ms).
+  A store without atomic locks makes it step aside with a warning.
 - `processhub:rebatch-queue --from=<queue> [--chunk] [--limit] [--rate]
   [--start-delay] [--max-ahead]` — repacks a Redis backlog of single-entry
   jobs into full batches (atomic chunk claim, progress acknowledged after
   every batch — a crash re-sends at most one batch; lock against concurrent
   runs; `:notify` kept in step). Batches are spread at `--rate` per minute
-  (default `rate_limit_per_minute`, `0` = all at once) after what already
+  (default 90 % of `rate_limit_per_minute`, the rest is left to live
+  traffic; `0` = all at once) after what already
   sits in the target queue, each with a full retry window from its due time;
   `--max-ahead` schedules a rolling window. Prepare the backlog with
   `RENAMENX` of `queues:logs` and `queues:logs:notify` (see README,
