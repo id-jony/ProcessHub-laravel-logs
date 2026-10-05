@@ -2,7 +2,7 @@
 
 /**
  * Run by FatalErrorFlushTest in a separate PHP process: boots the package,
- * writes a log record and dies ($argv[1]: memory-large | memory-small |
+ * writes a log record and dies ($argv[1]: memory-large |
  * timeout | uncaught). Jobs land in the sqlite database $argv[2]. With
  * $argv[3] = "unreported" Laravel's exception handler ignores FatalError.
  */
@@ -66,10 +66,9 @@ Log::warning('before fatal');
 
 if (str_starts_with($mode, 'memory')) {
     ini_set('memory_limit', (string) (memory_get_usage() + 16 * 1024 * 1024));
-    $chunk = $mode === 'memory-large' ? 1024 * 1024 : 100;
     $hog = [];
     while (true) {
-        $hog[] = str_repeat('x', $chunk);
+        $hog[] = str_repeat('x', 1024 * 1024);
     }
 }
 

@@ -179,7 +179,7 @@ Retries are limited only by time: a batch has `PROCESSHUB_LOG_RETRY_WINDOW_SEC` 
     ```
     or in `Handler::register()`: `$this->reportable(fn (\Throwable $e) => \ProcessHub\Logs\Jobs\SendLogBatchJob::isOwnFailure($e) ? false : null);`.
 - **Fatal errors under `php_admin_value[memory_limit]`** — the limit can't be raised, so the buffer may not be shipped on OOM. A system OOM (not the PHP limit) and `SIGKILL` lose the buffer.
-- **Out of memory in small allocations on Laravel 10** — Laravel 10 keeps ~32 KB for its own shutdown handler, which allocates more before any package code runs; whether that fits depends on heap fragmentation, so the buffer and the error may be lost. Laravel 11+ is not affected.
+- **Out of memory in many small allocations** — Laravel keeps only 32 KB for its own fatal-error handler, which runs before any package code; on some heaps `report()` needs more and dies, and then the buffer and the error are lost. Whether it happens depends on heap fragmentation, not on the package.
 - **`Log::error` before config is set** — handler silently drops (the install command warns you).
 
 ## Testing

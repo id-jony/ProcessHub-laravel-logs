@@ -15,9 +15,9 @@ formed a feedback loop (1.2M queued jobs, 600k failed, Redis OOM).
 
 ### Known limitations
 
-- Laravel 10: an out-of-memory fatal error caused by many small allocations
-  may lose the buffer — Laravel 10's shutdown handler needs more memory than
-  it reserves, before any package code runs. Laravel 11+ is not affected.
+- An out-of-memory fatal error caused by many small allocations may lose the
+  buffer: Laravel's own fatal-error handler (32 KB reserve) runs before any
+  package code and, depending on heap fragmentation, can die itself.
 
 ### Fixed
 

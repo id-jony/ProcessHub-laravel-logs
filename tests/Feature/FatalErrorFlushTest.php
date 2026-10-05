@@ -15,8 +15,10 @@ use Symfony\Component\Process\Process;
  *
  * Not covered, because it can't be: Laravel's shutdown handler runs before
  * any function the package registers, and a fatal error inside it skips
- * every later one. If Laravel skips reporting the FatalError (dontReport /
- * throttling) and rendering it then runs out of memory, the buffer is lost.
+ * every later one — e.g. memory exhausted in many small allocations leaves
+ * Laravel's 32 KB reserve too small for report() on some heaps, or Laravel
+ * skips reporting the FatalError (dontReport / throttling) and rendering it
+ * runs out of memory. Then the buffer is lost.
  */
 class FatalErrorFlushTest extends TestCase
 {
@@ -29,7 +31,6 @@ class FatalErrorFlushTest extends TestCase
 
         return [
             'out of memory, large allocation' => ['memory-large', $fatal, 'Allowed memory size', false],
-            'out of memory, small allocations' => ['memory-small', $fatal, 'Allowed memory size', false],
             'max_execution_time' => ['timeout', $fatal, 'Maximum execution time', false],
             'max_execution_time, not reported by Laravel' => ['timeout', $fatal, 'Maximum execution time', true],
             'uncaught exception' => ['uncaught', \RuntimeException::class, 'uncaught in script', false],
@@ -39,13 +40,6 @@ class FatalErrorFlushTest extends TestCase
     #[DataProvider('fatalErrors')]
     public function test_buffer_and_fatal_error_are_queued(string $mode, string $class, string $fatalMessage, bool $unreported): void
     {
-        if ($mode === 'memory-small' && version_compare($this->app->version(), '11.0.0', '<')) {
-            // Laravel 10 keeps ~32 KB for its shutdown handler, which allocates
-            // more before any package code runs; whether it fits depends on heap
-            // fragmentation, so the buffer may be lost there (see README).
-            $this->markTestSkipped('Laravel 10: out of memory in small allocations is not guaranteed.');
-        }
-
         $database = tempnam(sys_get_temp_dir(), 'processhub-fatal-');
 
         try {
