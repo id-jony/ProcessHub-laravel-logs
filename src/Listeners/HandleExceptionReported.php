@@ -15,6 +15,9 @@ use Illuminate\Support\Facades\Log;
  * default reporting chain (Sentry, Flare, etc.) still runs.
  *
  * Versions that don't support reportable() are a silent no-op.
+ *
+ * When processhub is also in the default log stack Laravel logs the same
+ * exception object once more — LogBuffer::claimException() keeps one entry.
  */
 class HandleExceptionReported
 {

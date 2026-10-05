@@ -37,4 +37,49 @@ class ExceptionContextTest extends TestCase
         $this->assertSame(42, $context['order_id']);
         $this->assertArrayNotHasKey('exception', $context);
     }
+
+    public function test_reported_exception_is_shipped_once_when_processhub_is_in_default_stack(): void
+    {
+        Queue::fake();
+        config()->set('logging.channels.stack', ['driver' => 'stack', 'channels' => ['processhub']]);
+        config()->set('logging.default', 'stack');
+
+        report(new \RuntimeException('boom'));
+        $this->app->terminate();
+
+        $this->assertSame(['boom'], $this->shippedMessages());
+    }
+
+    public function test_reported_exception_is_shipped_when_processhub_is_not_in_default_stack(): void
+    {
+        Queue::fake();
+        config()->set('logging.default', 'null');
+
+        report(new \RuntimeException('boom'));
+        $this->app->terminate();
+
+        $this->assertSame(['boom'], $this->shippedMessages());
+    }
+
+    public function test_distinct_exceptions_are_not_deduplicated(): void
+    {
+        Queue::fake();
+
+        Log::channel('processhub')->error('first', ['exception' => new \RuntimeException('a')]);
+        Log::channel('processhub')->error('second', ['exception' => new \RuntimeException('a')]);
+        $this->app->terminate();
+
+        $this->assertSame(['first', 'second'], $this->shippedMessages());
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function shippedMessages(): array
+    {
+        return Queue::pushed(SendLogBatchJob::class)
+            ->flatMap(fn (SendLogBatchJob $job) => array_column($job->entries, 'message'))
+            ->values()
+            ->all();
+    }
 }

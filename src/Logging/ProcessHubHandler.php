@@ -7,13 +7,14 @@ use Monolog\Level;
 use Monolog\LogRecord;
 use ProcessHub\Logs\Jobs\SendLogBatchJob;
 use ProcessHub\Logs\Redaction\Redactor;
+use Symfony\Component\ErrorHandler\Error\FatalError;
 
 /**
  * Monolog handler which queues log records for async delivery to ProcessHub.
  *
  * Records are collected in LogBuffer and shipped as one SendLogBatchJob per
- * `processhub.batch_size` entries (not one job per record); the buffer is
- * flushed on close()/reset() and at request/job/command boundaries.
+ * `processhub.batch_size` entries (not one job per record); see LogBuffer
+ * for when partial batches are shipped.
  *
  * Почему queue, а не sync HTTP:
  *   - Ingest endpoint может быть временно недоступен — ретрай через Laravel
@@ -108,7 +109,22 @@ class ProcessHubHandler extends AbstractProcessingHandler
             }
         }
 
+        // One entry per exception object: with processhub in the default
+        // stack Laravel logs a reported exception itself and
+        // HandleExceptionReported does it again.
+        $exception = $record->context['exception'] ?? null;
+        if ($exception instanceof \Throwable && ! $this->buffer->claimException($exception)) {
+            return;
+        }
+
         $this->buffer->push($this->buildEntry($record));
+
+        // Laravel reports a fatal error from its shutdown function and then
+        // renders it — under OOM that rendering may die again and skip every
+        // later shutdown function, ours included. Ship right away.
+        if ($exception instanceof FatalError) {
+            $this->buffer->flushOnShutdown();
+        }
     }
 
     public function close(): void
